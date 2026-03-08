@@ -238,6 +238,34 @@ class KillFilterView(discord.ui.View):
             )
             embed = build_summary_embed(kills, self.selected_categories, self.selected_time_key)
             await interaction.followup.send(embed=embed)
+
+            # ── Copyable pilot list for in-game mail ──────────────────────────
+            if kills:
+                names = [k.get("pilot_name", "Unknown") for k in kills if k.get("pilot_name") and k.get("pilot_name") not in ("Unknown", "Unknown (NPC)")]
+                if names:
+                    # Deduplicate while preserving order
+                    seen: set[str] = set()
+                    unique_names = [n for n in names if not (n in seen or seen.add(n))]
+                    pilot_block = "\n".join(unique_names)
+                    # Discord message limit is 2000 chars; chunk if needed
+                    header = f"📋 **Pilot list** ({len(unique_names)} pilots) — copy into EVE in-game mail:\n"
+                    chunk_limit = 1900 - len(header)
+                    if len(pilot_block) <= chunk_limit:
+                        await interaction.followup.send(f"{header}```\n{pilot_block}\n```")
+                    else:
+                        # Send first chunk with header, rest as plain continuations
+                        lines, chunk, chunks = unique_names, [], []
+                        for name in lines:
+                            if sum(len(n) + 1 for n in chunk) + len(name) + 1 > chunk_limit:
+                                chunks.append("\n".join(chunk))
+                                chunk = []
+                            chunk.append(name)
+                        if chunk:
+                            chunks.append("\n".join(chunk))
+                        await interaction.followup.send(f"{header}```\n{chunks[0]}\n```")
+                        for extra in chunks[1:]:
+                            await interaction.followup.send(f"```\n{extra}\n```")
+
             await interaction.edit_original_response(content="✅ Done!", view=None)
         except Exception as e:
             await interaction.edit_original_response(
