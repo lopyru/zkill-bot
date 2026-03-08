@@ -70,6 +70,7 @@ class KillFilterView(discord.ui.View):
         super().__init__(timeout=120)  # form expires after 2 minutes
         self.selected_categories: list[str] = []
         self.selected_time_key: str         = "24h"
+        self.selected_space:     list[str]  = ["nullsec", "lowsec"]
 
     # ── Ship category multi-select ────────────────────────────────────────────
 
@@ -97,8 +98,9 @@ class KillFilterView(discord.ui.View):
         label = ", ".join(
             SHIP_CATEGORIES[k]["label"] for k in self.selected_categories
         ) or "All ships (no filter)"
+        space_label = " + ".join({"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space"}[s] for s in self.selected_space)
         await interaction.response.edit_message(
-            content=f"✅ Categories: **{label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n\nHit **Fetch** when ready.",
+            content=f"✅ Categories: **{label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n🌌 Space: **{space_label}**\n\nHit **Fetch** when ready.",
             view=self,
         )
 
@@ -128,8 +130,35 @@ class KillFilterView(discord.ui.View):
         label = ", ".join(
             SHIP_CATEGORIES[k]["label"] for k in self.selected_categories
         ) or "All ships (no filter)"
+        space_label = " + ".join({"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space"}[s] for s in self.selected_space)
         await interaction.response.edit_message(
-            content=f"✅ Categories: **{label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n\nHit **Fetch** when ready.",
+            content=f"✅ Categories: **{label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n🌌 Space: **{space_label}**\n\nHit **Fetch** when ready.",
+            view=self,
+        )
+
+    # ── Space type multi-select ───────────────────────────────────────────────
+
+    @discord.ui.select(
+        placeholder="🌌  Space type…",
+        min_values=1,
+        max_values=3,
+        options=[
+            discord.SelectOption(label="Null Security",  value="nullsec",  emoji="⚫", default=True),
+            discord.SelectOption(label="Low Security",   value="lowsec",   emoji="🔴", default=True),
+            discord.SelectOption(label="Wormhole Space", value="wormhole", emoji="🌀", default=False),
+        ],
+    )
+    async def space_select(
+        self, select: discord.ui.Select, interaction: discord.Interaction
+    ):
+        self.selected_space = select.values
+        for option in select.options:
+            option.default = option.value in self.selected_space
+
+        cat_label   = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories) or "All ships (no filter)"
+        space_label = " + ".join(o.label for o in select.options if o.default)
+        await interaction.response.edit_message(
+            content=f"✅ Categories: **{cat_label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n🌌 Space: **{space_label}**\n\nHit **Fetch** when ready.",
             view=self,
         )
 
@@ -162,8 +191,9 @@ class KillFilterView(discord.ui.View):
             "esi":     "[ ] —",
             "names":   "[ ] —",
         }
-        last_edit = [0.0]
-        start_ts  = [_time.monotonic()]
+        last_edit   = [0.0]
+        start_ts    = [_time.monotonic()]
+        est_seconds = [0]   # filled in at zkill_start once total requests are known
 
         def _bar(done: int, total: int) -> str:
             if total == 0:
@@ -176,8 +206,15 @@ class KillFilterView(discord.ui.View):
             m, s = divmod(s, 60)
             return f"{m}m {s:02d}s" if m else f"{s}s"
 
+        def _fmt_est(s: int) -> str:
+            if s <= 0:
+                return "—"
+            m, sec = divmod(s, 60)
+            return f"~{m}m {sec:02d}s" if m else f"~{sec}s"
+
         def build_status() -> str:
             sep = "─" * 44
+            eta = f"  (est. {_fmt_est(est_seconds[0])})" if est_seconds[0] else ""
             return (
                 f"```\n"
                 f"▶  {cat_label[:38]}  /  {time_label}\n"
@@ -187,7 +224,7 @@ class KillFilterView(discord.ui.View):
                 f"ESI         {stages['esi']}\n"
                 f"Names       {stages['names']}\n"
                 f"{sep}\n"
-                f"Elapsed     {_elapsed()}\n"
+                f"Elapsed     {_elapsed()}{eta}\n"
                 f"```"
             )
 
@@ -199,7 +236,8 @@ class KillFilterView(discord.ui.View):
                 stages["regions"] = f"[✓] {event['count']} regions"
                 stages["zkill"]   = "[~] starting..."
             elif phase == "zkill_start":
-                total = event["types"] * event["regions"]
+                total = event["types"]   # already = total requests (groups×regions + types×regions)
+                est_seconds[0] = total   # 1 req/s → total seconds
                 stages["zkill"] = f"[~] {_bar(0, total)}  0/{total}"
             elif phase == "zkill_progress":
                 done, total, found = event["done"], event["total"], event["found"]
@@ -252,6 +290,7 @@ class KillFilterView(discord.ui.View):
             kills = await fetch_all_kills(
                 category_keys=categories,
                 past_seconds=past_seconds,
+                space_types=self.selected_space,
                 on_progress=on_progress,
             )
             embed = build_summary_embed(kills, self.selected_categories, self.selected_time_key)
@@ -321,10 +360,11 @@ async def kills(ctx: discord.ApplicationContext):
     await ctx.respond(
         content=(
             "**Kill Report Filters**\n"
-            "Select ship categories and a time range, then hit **Fetch**.\n"
+            "Select ship categories, time range, and space type, then hit **Fetch**.\n"
             "Leave categories empty to fetch all ships.\n\n"
             "✅ Categories: **All ships (no filter)**\n"
-            "⏱ Time range: **Last 24 hours**"
+            "⏱ Time range: **Last 24 hours**\n"
+            "🌌 Space: **Null Security + Low Security**"
         ),
         view=view,
         ephemeral=True,

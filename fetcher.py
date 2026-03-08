@@ -30,8 +30,9 @@ EXCLUDED_CORP_IDS: set[int] = {
     int(x) for x in os.getenv("EXCLUDED_CORP_IDS", "").split(",") if x.strip()
 }
 
-# Module-level cache so NullSec/LowSec region IDs are only discovered once per process
-_nulllow_regions_cache: list[int] | None = None
+# Module-level cache so region IDs are only discovered once per process
+# Keys: "nullsec", "lowsec", "wormhole"
+_region_cache: dict[str, list[int]] | None = None
 
 HEADERS = {
     "Accept-Encoding": "gzip",
@@ -113,12 +114,18 @@ SHIP_CATEGORIES: dict[str, dict] = {
 
 # ── Time range options ────────────────────────────────────────────────────────
 TIME_RANGES: dict[str, dict] = {
-    "1h":  {"label": "Last 1 hour",   "seconds": 3600},
-    "6h":  {"label": "Last 6 hours",  "seconds": 21600},
-    "12h": {"label": "Last 12 hours", "seconds": 43200},
-    "24h": {"label": "Last 24 hours", "seconds": 86400},
-    "48h": {"label": "Last 48 hours", "seconds": 172800},
-    "7d":  {"label": "Last 7 days",   "seconds": 604800},
+    "1m":  {"label": "Last 1 minute",  "seconds": 60},
+    "2m":  {"label": "Last 2 minutes", "seconds": 120},
+    "5m":  {"label": "Last 5 minutes", "seconds": 300},
+    "10m": {"label": "Last 10 minutes","seconds": 600},
+    "15m": {"label": "Last 15 minutes","seconds": 900},
+    "30m": {"label": "Last 30 minutes","seconds": 1800},
+    "1h":  {"label": "Last 1 hour",    "seconds": 3600},
+    "6h":  {"label": "Last 6 hours",   "seconds": 21600},
+    "12h": {"label": "Last 12 hours",  "seconds": 43200},
+    "24h": {"label": "Last 24 hours",  "seconds": 86400},
+    "48h": {"label": "Last 48 hours",  "seconds": 172800},
+    "7d":  {"label": "Last 7 days",    "seconds": 604800},
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -150,22 +157,29 @@ async def fetch_json(client: httpx.AsyncClient, url: str, delay: float = 0.0, _r
     print(f"  Giving up after {_retries} attempts: {url}")
     return None
 
-# ── Step 1: Discover NullSec / LowSec regions ────────────────────────────────
+# ── Step 1: Discover regions by security type ────────────────────────────────
 
-async def get_nulllow_regions(client: httpx.AsyncClient) -> list[int]:
-    global _nulllow_regions_cache
-    if _nulllow_regions_cache is not None:
-        print(f"Using cached region list ({len(_nulllow_regions_cache)} NullSec/LowSec regions).")
-        return _nulllow_regions_cache
+async def get_regions(client: httpx.AsyncClient) -> dict[str, list[int]]:
+    """Returns {"nullsec": [...], "lowsec": [...], "wormhole": [...]} cached for the process lifetime."""
+    global _region_cache
+    if _region_cache is not None:
+        total = sum(len(v) for v in _region_cache.values())
+        print(f"Using cached region list ({total} regions: "
+              f"{len(_region_cache['nullsec'])} NS / {len(_region_cache['lowsec'])} LS / "
+              f"{len(_region_cache['wormhole'])} WH).")
+        return _region_cache
 
     print("Fetching region list from ESI...")
     all_regions = await fetch_json(client, f"{ESI_BASE}/universe/regions/?datasource=tranquility")
     if not all_regions:
         raise RuntimeError("Could not fetch region list from ESI.")
 
-    kspace = [r for r in all_regions if r < 11000000]
-    print(f"  {len(kspace)} k-space regions to check.")
-    nulllow = []
+    wormhole = sorted(r for r in all_regions if r >= 11000000)
+    kspace   = [r for r in all_regions if r < 11000000]
+    print(f"  {len(kspace)} k-space regions to classify, {len(wormhole)} wormhole regions (by ID range).")
+
+    nullsec: list[int] = []
+    lowsec:  list[int] = []
 
     for region_id in kspace:
         region_data = await fetch_json(
@@ -197,14 +211,16 @@ async def get_nulllow_regions(client: httpx.AsyncClient) -> list[int]:
             continue
 
         sec = sys_data.get("security_status", 1.0)
-        if sec < 0.45:
-            sec_type = "NullSec" if sec < 0.0 else "LowSec "
-            print(f"  + [{sec_type}] {region_data.get('name', region_id)} (sec={sec:.2f})")
-            nulllow.append(region_id)
+        if sec < 0.0:
+            print(f"  + [NullSec] {region_data.get('name', region_id)} (sec={sec:.2f})")
+            nullsec.append(region_id)
+        elif sec < 0.45:
+            print(f"  + [LowSec ] {region_data.get('name', region_id)} (sec={sec:.2f})")
+            lowsec.append(region_id)
 
-    print(f"\n  {len(nulllow)} NullSec/LowSec regions found.")
-    _nulllow_regions_cache = nulllow
-    return nulllow
+    print(f"\n  {len(nullsec)} NullSec, {len(lowsec)} LowSec, {len(wormhole)} Wormhole regions found.")
+    _region_cache = {"nullsec": nullsec, "lowsec": lowsec, "wormhole": wormhole}
+    return _region_cache
 
 # ── Step 2: Fetch kills per region ───────────────────────────────────────────
 
@@ -393,7 +409,8 @@ async def enrich_kills(
 async def fetch_all_kills(
     category_keys: list[str] | None = None,
     past_seconds: int = 86400,
-    on_progress=None,           # optional async callable: on_progress(dict) -> None
+    space_types: list[str] | None = None,  # subset of ["nullsec", "lowsec", "wormhole"]
+    on_progress=None,                       # optional async callable: on_progress(dict) -> None
 ) -> list[dict]:
     """
     Full pipeline with optional filters.
@@ -402,6 +419,7 @@ async def fetch_all_kills(
         category_keys: list of keys from SHIP_CATEGORIES to include.
                        Pass None or empty list to match ALL ships.
         past_seconds:  time window in seconds (must be multiple of 3600, max 604800).
+        space_types:   which space to search. Defaults to ["nullsec", "lowsec"].
     """
     # Build group and type pairs from selected categories
     group_pairs: list[tuple[int, int]] = []
@@ -415,8 +433,11 @@ async def fetch_all_kills(
             for tid in cat.get("type_ids", set()):
                 type_pairs.append((tid, 0))
 
+    selected_space = set(space_types) if space_types else {"nullsec", "lowsec"}
+
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
-        regions = await get_nulllow_regions(client)
+        region_map = await get_regions(client)
+        regions = [r for t in ("nullsec", "lowsec", "wormhole") if t in selected_space for r in region_map[t]]
 
         if not category_keys:
             # ── Unfiltered path: fetch all kills per region ───────────────────
@@ -467,7 +488,7 @@ async def fetch_all_kills(
                     matched_raw.append(k)
             if new_hits:
                 print(f"  [{done_count}/{total_tasks}] groupID {group_id} / region {region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
-            elif done_count % 50 == 0:
+            elif done_count % 10 == 0:
                 print(f"  [{done_count}/{total_tasks}] still scanning... ({len(matched_raw)} hits so far)")
             if on_progress and (done_count % 20 == 0 or done_count == total_tasks):
                 await on_progress({
@@ -489,7 +510,7 @@ async def fetch_all_kills(
                     new_hits += 1
             if new_hits:
                 print(f"  [{done_count}/{total_tasks}] shipID {type_id} / region {region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
-            elif done_count % 50 == 0:
+            elif done_count % 10 == 0:
                 print(f"  [{done_count}/{total_tasks}] still scanning... ({len(matched_raw)} hits so far)")
             if on_progress and (done_count % 20 == 0 or done_count == total_tasks):
                 await on_progress({
