@@ -244,7 +244,7 @@ async def _fetch_ship_region(
             url  = f"{ZKILL_BASE}/ship/{type_id}/regionID/{region_id}/pastSeconds/{past_seconds}/page/{page}/"
             data = await fetch_json(client, url, delay=0)  # delay handled below
             await asyncio.sleep(REQUEST_DELAY)              # always delay — even on 404/error
-            if not data:
+            if not isinstance(data, list) or not data:
                 break
             kills.extend(data)
             if len(data) < 100:
