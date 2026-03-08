@@ -12,7 +12,7 @@ USER_AGENT    = "zkill-nulllow-fetcher/1.0 maintainer@example.com"
 REQUEST_DELAY = 1.0   # seconds between zKill requests — be polite
 ESI_DELAY     = 0.5    # 500ms — conservative; ESI error budget monitored at runtime
 MAX_PAGE          = 10    # safety cap per region
-ZKILL_CONCURRENCY = 3     # parallel zKillboard requests — keep well under their limit
+ZKILL_CONCURRENCY = 1     # serialize all zKill requests — their limit is ~1 req/s
 
 ZKILL_BASE = "https://zkillboard.com/api"
 ESI_BASE   = "https://esi.evetech.net/latest"
@@ -111,7 +111,7 @@ async def fetch_json(client: httpx.AsyncClient, url: str, delay: float = 0.0, _r
         try:
             resp = await client.get(url, timeout=30)
             if resp.status_code == 429:
-                retry_after = float(resp.headers.get("Retry-After", 60))
+                retry_after = max(30.0, float(resp.headers.get("Retry-After", 60)))
                 print(f"  429 rate-limited — sleeping {retry_after:.0f}s (attempt {attempt + 1}/{_retries})")
                 await asyncio.sleep(retry_after)
                 continue
@@ -229,7 +229,8 @@ async def _fetch_ship_region(
         page  = 1
         while page <= MAX_PAGE:
             url  = f"{ZKILL_BASE}/ship/{type_id}/regionID/{region_id}/pastSeconds/{past_seconds}/page/{page}/"
-            data = await fetch_json(client, url, delay=REQUEST_DELAY)
+            data = await fetch_json(client, url, delay=0)  # delay handled below
+            await asyncio.sleep(REQUEST_DELAY)              # always delay — even on 404/error
             if not data:
                 break
             kills.extend(data)
