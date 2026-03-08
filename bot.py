@@ -138,6 +138,7 @@ class KillFilterView(discord.ui.View):
         self, button: discord.ui.Button, interaction: discord.Interaction
     ):
         global fetch_in_progress
+        import time as _time
 
         if fetch_in_progress:
             await interaction.response.edit_message(
@@ -145,18 +146,63 @@ class KillFilterView(discord.ui.View):
             )
             return
 
-        # Disable the form immediately so it can't be submitted twice
         self.disable_all_items()
         time_label = TIME_RANGES[self.selected_time_key]["label"]
         cat_label  = (
             ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories)
             or "All ships"
         )
-        await interaction.response.edit_message(
-            content=f"🔍 Fetching **{cat_label}** kills for **{time_label}**…",
-            view=self,
-        )
 
+        # ── Live progress state ───────────────────────────────────────────────
+        stages = {
+            "regions":  "⏳ discovering...",
+            "zkill":    "─",
+            "esi":      "─",
+            "names":    "─",
+        }
+        last_edit = [0.0]  # mutable for closure
+
+        def build_status() -> str:
+            return (
+                f"🔍 **{cat_label}**  ·  {time_label}\n"
+                f"```\n"
+                f"Regions     {stages['regions']}\n"
+                f"zKillboard  {stages['zkill']}\n"
+                f"ESI         {stages['esi']}\n"
+                f"Names       {stages['names']}\n"
+                f"```"
+            )
+
+        await interaction.response.edit_message(content=build_status(), view=self)
+
+        async def on_progress(event: dict):
+            phase = event.get("phase")
+            if phase == "regions":
+                stages["regions"] = f"✅ {event['count']} regions"
+                stages["zkill"]   = "⏳ querying..."
+            elif phase == "zkill_start":
+                stages["zkill"] = f"⏳ {event['types']} types × {event['regions']} regions"
+            elif phase == "zkill_done":
+                found = event["found"]
+                stages["zkill"] = f"✅ {found} kill{'s' if found != 1 else ''} matched"
+                stages["esi"]   = f"⏳ 0 / {found}"
+            elif phase == "esi":
+                stages["esi"] = f"⏳ {event['done']} / {event['total']}"
+            elif phase == "names":
+                stages["esi"]   = stages["esi"].replace("⏳", "✅")
+                stages["names"] = "⏳ resolving..."
+
+            # Throttle Discord edits to ~1 per 3 seconds
+            now = _time.monotonic()
+            if now - last_edit[0] < 3.0:
+                return
+            last_edit[0] = now
+            try:
+                await interaction.edit_original_response(content=build_status())
+            except Exception:
+                pass
+
+        # ── Run fetch ─────────────────────────────────────────────────────────
         fetch_in_progress = True
         past_seconds      = TIME_RANGES[self.selected_time_key]["seconds"]
         categories        = self.selected_categories or None
@@ -165,11 +211,10 @@ class KillFilterView(discord.ui.View):
             kills = await fetch_all_kills(
                 category_keys=categories,
                 past_seconds=past_seconds,
+                on_progress=on_progress,
             )
             embed = build_summary_embed(kills, self.selected_categories, self.selected_time_key)
-            # Post the result publicly in the channel
             await interaction.followup.send(embed=embed)
-            # Clean up the ephemeral form
             await interaction.edit_original_response(content="✅ Done!", view=None)
         except Exception as e:
             await interaction.edit_original_response(

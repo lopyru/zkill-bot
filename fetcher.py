@@ -12,7 +12,7 @@ USER_AGENT    = "zkill-nulllow-fetcher/1.0 maintainer@example.com"
 REQUEST_DELAY = 1.0   # seconds between zKill requests — be polite
 ESI_DELAY     = 0.2    # 200ms — ESI recommends staying well under 20 req/s
 MAX_PAGE          = 10    # safety cap per region
-ZKILL_CONCURRENCY = 5     # parallel zKillboard requests (ship-filter path)
+ZKILL_CONCURRENCY = 3     # parallel zKillboard requests — keep well under their limit
 
 ZKILL_BASE = "https://zkillboard.com/api"
 ESI_BASE   = "https://esi.evetech.net/latest"
@@ -345,6 +345,7 @@ async def enrich_kills(
 async def fetch_all_kills(
     category_keys: list[str] | None = None,
     past_seconds: int = 86400,
+    on_progress=None,           # optional async callable: on_progress(dict) -> None
 ) -> list[dict]:
     """
     Full pipeline with optional filters.
@@ -364,7 +365,7 @@ async def fetch_all_kills(
     else:
         target_ids = set()  # empty = no filter (all ships)
 
-    async with httpx.AsyncClient(headers=HEADERS) as client:
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
         regions = await get_nulllow_regions(client)
 
         if not target_ids:
@@ -384,7 +385,13 @@ async def fetch_all_kills(
             return raw_killmails
 
         # ── Filtered path: zkill ship-type filter → ESI killmail → bulk names ─
+        if on_progress:
+            await on_progress({"phase": "regions", "count": len(regions)})
+
         print(f"\nFetching {len(target_ids)} ship type(s) across {len(regions)} regions in parallel...")
+        if on_progress:
+            await on_progress({"phase": "zkill_start", "types": len(target_ids), "regions": len(regions)})
+
         semaphore = asyncio.Semaphore(ZKILL_CONCURRENCY)
         tasks = [
             _fetch_ship_region(client, type_id, region_id, past_seconds, semaphore)
@@ -405,13 +412,15 @@ async def fetch_all_kills(
                     matched_raw.append(k)
 
         print(f"  {len(matched_raw)} matching kills from zKillboard.")
+        if on_progress:
+            await on_progress({"phase": "zkill_done", "found": len(matched_raw)})
 
         # Fetch ESI killmails only for the matched kills (far fewer than before)
         print(f"  Fetching ESI killmails for {len(matched_raw)} kills...")
         enriched: list[dict] = []
         char_ids: list[int] = []
 
-        for k in matched_raw:
+        for i, k in enumerate(matched_raw):
             killmail_id = k.get("killmail_id")
             zkb         = k.get("zkb", {})
             km_hash     = zkb.get("hash")
@@ -439,8 +448,14 @@ async def fetch_all_kills(
                 "pilot_name":      None,  # filled in below
             })
 
+            if on_progress and i % 5 == 0:
+                await on_progress({"phase": "esi", "done": i + 1, "total": len(matched_raw)})
+
         # Resolve all pilot names in one bulk POST instead of N individual calls
         print(f"  Bulk-resolving {len(set(char_ids) - {0})} character names...")
+        if on_progress:
+            await on_progress({"phase": "names"})
+
         name_map = await resolve_names_bulk(
             client, [cid for cid in char_ids if cid]
         )
