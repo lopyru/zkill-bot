@@ -407,24 +407,21 @@ async def fetch_all_kills(
         if on_progress:
             await on_progress({"phase": "regions", "count": len(regions)})
 
-        print(f"\nFetching {len(target_ids)} ship type(s) across {len(regions)} regions in parallel...")
+        pairs       = [(type_id, region_id) for type_id in target_ids for region_id in regions]
+        total_tasks = len(pairs)
+        done_count  = 0
+
+        print(f"\nFetching {len(target_ids)} ship type(s) across {len(regions)} regions sequentially ({total_tasks} requests)...")
         if on_progress:
             await on_progress({"phase": "zkill_start", "types": len(target_ids), "regions": len(regions)})
 
-        semaphore   = asyncio.Semaphore(ZKILL_CONCURRENCY)
-        tasks       = [
-            _fetch_ship_region(client, type_id, region_id, past_seconds, semaphore)
-            for type_id in target_ids
-            for region_id in regions
-        ]
-        total_tasks = len(tasks)
-        done_count  = 0
-
-        # Use as_completed so we can report progress as queries finish
-        seen_ids:    set[int]  = set()
+        semaphore    = asyncio.Semaphore(ZKILL_CONCURRENCY)
+        seen_ids:    set[int]   = set()
         matched_raw: list[dict] = []
-        for coro in asyncio.as_completed(tasks):
-            type_id, kills = await coro
+
+        # Sequential iteration — avoids background tasks outliving the httpx client
+        for type_id, region_id in pairs:
+            _, kills = await _fetch_ship_region(client, type_id, region_id, past_seconds, semaphore)
             done_count += 1
             for k in kills:
                 kid = k.get("killmail_id")
