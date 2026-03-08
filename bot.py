@@ -3,6 +3,7 @@ bot.py — py-cord Discord bot with interactive filter form.
 """
 
 import os
+import time as _time
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -135,10 +136,9 @@ class KillFilterView(discord.ui.View):
 
     @discord.ui.button(label="Fetch", style=discord.ButtonStyle.danger, emoji="🔍")
     async def fetch_button(
-        self, button: discord.ui.Button, interaction: discord.Interaction
+        self, _button: discord.ui.Button, interaction: discord.Interaction
     ):
         global fetch_in_progress
-        import time as _time
 
         if fetch_in_progress:
             await interaction.response.edit_message(
@@ -154,22 +154,39 @@ class KillFilterView(discord.ui.View):
         )
 
         # ── Live progress state ───────────────────────────────────────────────
+        W = 14  # progress bar width (chars)
         stages = {
-            "regions":  "⏳ discovering...",
-            "zkill":    "─",
-            "esi":      "─",
-            "names":    "─",
+            "regions": "[ ] discovering...",
+            "zkill":   "[ ] —",
+            "esi":     "[ ] —",
+            "names":   "[ ] —",
         }
-        last_edit = [0.0]  # mutable for closure
+        last_edit = [0.0]
+        start_ts  = [_time.monotonic()]
+
+        def _bar(done: int, total: int) -> str:
+            if total == 0:
+                return "─" * W
+            filled = round(W * done / total)
+            return "█" * filled + "░" * (W - filled)
+
+        def _elapsed() -> str:
+            s = int(_time.monotonic() - start_ts[0])
+            m, s = divmod(s, 60)
+            return f"{m}m {s:02d}s" if m else f"{s}s"
 
         def build_status() -> str:
+            sep = "─" * 44
             return (
-                f"🔍 **{cat_label}**  ·  {time_label}\n"
                 f"```\n"
+                f"▶  {cat_label[:38]}  /  {time_label}\n"
+                f"{sep}\n"
                 f"Regions     {stages['regions']}\n"
                 f"zKillboard  {stages['zkill']}\n"
                 f"ESI         {stages['esi']}\n"
                 f"Names       {stages['names']}\n"
+                f"{sep}\n"
+                f"Elapsed     {_elapsed()}\n"
                 f"```"
             )
 
@@ -178,23 +195,29 @@ class KillFilterView(discord.ui.View):
         async def on_progress(event: dict):
             phase = event.get("phase")
             if phase == "regions":
-                stages["regions"] = f"✅ {event['count']} regions"
-                stages["zkill"]   = "⏳ querying..."
+                stages["regions"] = f"[✓] {event['count']} regions"
+                stages["zkill"]   = "[~] starting..."
             elif phase == "zkill_start":
-                stages["zkill"] = f"⏳ {event['types']} types × {event['regions']} regions"
+                total = event["types"] * event["regions"]
+                stages["zkill"] = f"[~] {_bar(0, total)}  0/{total}"
+            elif phase == "zkill_progress":
+                done, total, found = event["done"], event["total"], event["found"]
+                stages["zkill"] = f"[~] {_bar(done, total)}  {done}/{total}  ({found} hits)"
             elif phase == "zkill_done":
                 found = event["found"]
-                stages["zkill"] = f"✅ {found} kill{'s' if found != 1 else ''} matched"
-                stages["esi"]   = f"⏳ 0 / {found}"
+                stages["zkill"] = f"[✓] {found} kill{'s' if found != 1 else ''} found"
+                stages["esi"]   = f"[~] {_bar(0, found)}  0/{found}"
             elif phase == "esi":
-                stages["esi"] = f"⏳ {event['done']} / {event['total']}"
+                done, total = event["done"], event["total"]
+                stages["esi"] = f"[~] {_bar(done, total)}  {done}/{total}"
             elif phase == "names":
-                stages["esi"]   = stages["esi"].replace("⏳", "✅")
-                stages["names"] = "⏳ resolving..."
+                done_esi = stages["esi"]
+                stages["esi"]   = done_esi.replace("[~]", "[✓]")
+                stages["names"] = "[~] resolving..."
 
-            # Throttle Discord edits to ~1 per 3 seconds
+            # Throttle Discord edits to ~1 per 2 seconds
             now = _time.monotonic()
-            if now - last_edit[0] < 3.0:
+            if now - last_edit[0] < 2.0:
                 return
             last_edit[0] = now
             try:

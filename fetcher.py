@@ -392,24 +392,34 @@ async def fetch_all_kills(
         if on_progress:
             await on_progress({"phase": "zkill_start", "types": len(target_ids), "regions": len(regions)})
 
-        semaphore = asyncio.Semaphore(ZKILL_CONCURRENCY)
-        tasks = [
+        semaphore   = asyncio.Semaphore(ZKILL_CONCURRENCY)
+        tasks       = [
             _fetch_ship_region(client, type_id, region_id, past_seconds, semaphore)
             for type_id in target_ids
             for region_id in regions
         ]
-        results = await asyncio.gather(*tasks)
+        total_tasks = len(tasks)
+        done_count  = 0
 
-        # Deduplicate across type_id × region combinations
-        seen_ids: set[int] = set()
+        # Use as_completed so we can report progress as queries finish
+        seen_ids:    set[int]  = set()
         matched_raw: list[dict] = []
-        for type_id, kills in results:
+        for coro in asyncio.as_completed(tasks):
+            type_id, kills = await coro
+            done_count += 1
             for k in kills:
                 kid = k.get("killmail_id")
                 if kid and kid not in seen_ids:
                     seen_ids.add(kid)
                     k["_ship_type_id"] = type_id
                     matched_raw.append(k)
+            if on_progress and (done_count % 20 == 0 or done_count == total_tasks):
+                await on_progress({
+                    "phase": "zkill_progress",
+                    "done":  done_count,
+                    "total": total_tasks,
+                    "found": len(matched_raw),
+                })
 
         print(f"  {len(matched_raw)} matching kills from zKillboard.")
         if on_progress:
