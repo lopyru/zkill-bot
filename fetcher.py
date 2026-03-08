@@ -10,7 +10,7 @@ import httpx
 # ── Config ────────────────────────────────────────────────────────────────────
 USER_AGENT    = "zkill-nulllow-fetcher/1.0 maintainer@example.com"
 REQUEST_DELAY = 1.0   # seconds between zKill requests — be polite
-ESI_DELAY     = 0.2    # 200ms — ESI recommends staying well under 20 req/s
+ESI_DELAY     = 0.5    # 500ms — conservative; ESI error budget monitored at runtime
 MAX_PAGE          = 10    # safety cap per region
 ZKILL_CONCURRENCY = 3     # parallel zKillboard requests — keep well under their limit
 
@@ -116,6 +116,11 @@ async def fetch_json(client: httpx.AsyncClient, url: str, delay: float = 0.0, _r
                 await asyncio.sleep(retry_after)
                 continue
             resp.raise_for_status()
+            # Watch ESI error budget — back off hard if running low
+            error_remaining = int(resp.headers.get("X-ESI-Error-Limit-Remain", 100))
+            if error_remaining < 20:
+                print(f"  ⚠ ESI error budget low ({error_remaining} remaining) — pausing 10s")
+                await asyncio.sleep(10)
             if delay:
                 await asyncio.sleep(delay)
             return resp.json()
