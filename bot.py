@@ -24,6 +24,7 @@ intents = discord.Intents.default()
 bot     = discord.Bot(intents=intents)
 
 fetch_in_progress = False
+_skip_first_daily = True   # skip the immediate fire on startup; run after first 24h interval
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -229,6 +230,23 @@ class KillFilterView(discord.ui.View):
         fetch_in_progress = True
         past_seconds      = TIME_RANGES[self.selected_time_key]["seconds"]
         categories        = self.selected_categories or None
+        channel           = interaction.channel
+
+        async def safe_send(content=None, embed=None):
+            """Try interaction followup first; fall back to channel if token expired."""
+            try:
+                await interaction.followup.send(content=content, embed=embed)
+                return
+            except Exception:
+                pass
+            if channel:
+                await channel.send(content=content, embed=embed)
+
+        async def safe_edit(content):
+            try:
+                await interaction.edit_original_response(content=content, view=None)
+            except Exception:
+                pass  # token expired — progress panel is already stale, ignore
 
         try:
             kills = await fetch_all_kills(
@@ -237,23 +255,20 @@ class KillFilterView(discord.ui.View):
                 on_progress=on_progress,
             )
             embed = build_summary_embed(kills, self.selected_categories, self.selected_time_key)
-            await interaction.followup.send(embed=embed)
+            await safe_send(embed=embed)
 
             # ── Copyable pilot list for in-game mail ──────────────────────────
             if kills:
                 names = [k.get("pilot_name", "Unknown") for k in kills if k.get("pilot_name") and k.get("pilot_name") not in ("Unknown", "Unknown (NPC)")]
                 if names:
-                    # Deduplicate while preserving order
                     seen: set[str] = set()
                     unique_names = [n for n in names if not (n in seen or seen.add(n))]
                     pilot_block = "\n".join(unique_names)
-                    # Discord message limit is 2000 chars; chunk if needed
                     header = f"📋 **Pilot list** ({len(unique_names)} pilots) — copy into EVE in-game mail:\n"
                     chunk_limit = 1900 - len(header)
                     if len(pilot_block) <= chunk_limit:
-                        await interaction.followup.send(f"{header}```\n{pilot_block}\n```")
+                        await safe_send(content=f"{header}```\n{pilot_block}\n```")
                     else:
-                        # Send first chunk with header, rest as plain continuations
                         lines, chunk, chunks = unique_names, [], []
                         for name in lines:
                             if sum(len(n) + 1 for n in chunk) + len(name) + 1 > chunk_limit:
@@ -262,15 +277,13 @@ class KillFilterView(discord.ui.View):
                             chunk.append(name)
                         if chunk:
                             chunks.append("\n".join(chunk))
-                        await interaction.followup.send(f"{header}```\n{chunks[0]}\n```")
+                        await safe_send(content=f"{header}```\n{chunks[0]}\n```")
                         for extra in chunks[1:]:
-                            await interaction.followup.send(f"```\n{extra}\n```")
+                            await safe_send(content=f"```\n{extra}\n```")
 
-            await interaction.edit_original_response(content="✅ Done!", view=None)
+            await safe_edit("✅ Done!")
         except Exception as e:
-            await interaction.edit_original_response(
-                content=f"❌ Fetch failed: `{e}`", view=None
-            )
+            await safe_edit(f"❌ Fetch failed: `{e}`")
         finally:
             fetch_in_progress = False
 
@@ -329,6 +342,10 @@ async def ping(ctx: discord.ApplicationContext):
 
 @tasks.loop(hours=24)
 async def daily_kill_summary():
+    global _skip_first_daily
+    if _skip_first_daily:
+        _skip_first_daily = False
+        return
     channel = bot.get_channel(AUTO_POST_CHANNEL_ID)
     if not channel:
         print(f"[WARNING] Auto-post channel {AUTO_POST_CHANNEL_ID} not found.")

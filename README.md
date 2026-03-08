@@ -15,11 +15,11 @@ A Discord bot that fetches EVE Online killmail data from [zKillboard](https://zk
 
 | Key | Label | Ships included |
 |---|---|---|
-| `industrial` | Industrial & Hauling | T1 Industrials, Blockade Runners, Deep Space Transports, Freighters, Jump Freighters |
-| `mining` | Mining | Mining Barges (Covetor/Retriever/Procurer), Exhumers (Hulk/Mackinaw/Skiff), Mining Frigates (Venture/Prospect/Endurance/Outrider/Pioneer Consortium Issue), Porpoise, Orca, Rorqual, Noctis |
+| `industrial` | Industrial & Hauling | T1 Industrials, Deep Space Transports, Blockade Runners, Freighters, Jump Freighters |
+| `mining` | Mining | Mining Barges (Covetor/Retriever/Procurer), Exhumers (Hulk/Mackinaw/Skiff), Expedition Frigates (Prospect/Endurance), Venture, Outrider, Pioneer Consortium Issue, Porpoise, Orca, Rorqual, Noctis |
 | `exploration` | Exploration | Covert Ops Frigates, T3 Cruisers, Expedition Frigates, Astero, Stratios |
 | `capital` | Capital Ships | Carriers, Dreadnoughts, Force Auxiliaries, Supercarriers, Titans |
-| `pvp_cruiser` | PvP Cruisers & BCs | Heavy Assault Cruisers, Command Ships, Recon Ships |
+| `pvp_cruiser` | PvP Cruisers & BCs | Heavy Assault Cruisers, Command Ships, Force Recon Ships, Combat Recon Ships |
 
 ## Setup
 
@@ -95,9 +95,9 @@ zkill-bot/
 ## How the fetch pipeline works
 
 1. **Discover regions** — Queries ESI for all k-space regions, samples one system per region to determine security status, and caches the resulting NullSec/LowSec region list for the lifetime of the process.
-2. **Fetch matching kills** — For each selected ship type ID × NullSec/LowSec region, queries zKillboard's ship-filter endpoint (`/api/ship/{typeID}/regionID/{regionID}/...`). Requests are serialized (1 per second) so only kills matching the chosen ship types are returned — no bulk ESI killmail scanning required.
-3. **Enrich** — Fetches the full ESI killmail for each matched kill to retrieve the victim's character ID, alliance, and corporation; filters out victims from excluded alliances or corporations; then resolves all remaining pilot names in a single bulk POST to `/universe/names/`.
-4. **Rate limiting** — Strictly 1 req/s to zKillboard (delay applied even on 404 responses); 500 ms between ESI requests; minimum 30 s backoff on HTTP 429; ESI error budget monitored via `X-ESI-Error-Limit-Remain` (pauses 10 s if < 20 remaining).
+2. **Fetch matching kills** — For each selected ship group ID (or individual type ID for ships without a clean group) × NullSec/LowSec region, queries zKillboard's group-filter endpoint (`/api/groupID/{groupID}/regionID/{regionID}/...`) or ship-filter endpoint (`/api/shipID/{typeID}/...`). Requests are serialized (1 per second). Using group IDs reduces the typical industrial+mining query from ~2 100 requests to ~770 (~3× faster).
+3. **Enrich** — Fetches the full ESI killmail for each matched kill to retrieve the victim's character ID, ship type, alliance, and corporation; filters out victims from excluded alliances or corporations; then resolves all remaining pilot names in a single bulk POST to `/universe/names/`.
+4. **Rate limiting** — Strictly 1 req/s to zKillboard (delay applied even on 404 responses); 100 ms between ESI requests; minimum 30 s backoff on HTTP 429; ESI error budget monitored via `X-ESI-Error-Limit-Remain` (pauses 10 s if < 20 remaining).
 
 ## Time ranges
 

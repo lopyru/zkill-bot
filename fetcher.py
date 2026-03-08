@@ -14,7 +14,7 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 USER_AGENT    = "zkill-nulllow-fetcher/1.0 maintainer@example.com"
 REQUEST_DELAY = 1.0   # seconds between zKill requests — be polite
-ESI_DELAY     = 0.5    # 500ms — conservative; ESI error budget monitored at runtime
+ESI_DELAY     = 0.1    # 100ms = 10 req/s — well under ESI's 20 req/s limit; error budget monitored at runtime
 MAX_PAGE          = 10    # safety cap per region
 ZKILL_CONCURRENCY = 1     # serialize all zKill requests — their limit is ~1 req/s
 
@@ -47,63 +47,67 @@ SHIP_CATEGORIES: dict[str, dict] = {
     "industrial": {
         "label": "Industrial & Hauling",
         "emoji": "📦",
-        "type_ids": {
-            648, 649, 650, 651, 652, 653, 654, 655,   # T1 Industrials
-            11466, 11567, 12729, 12731, 13477, 13479,  # Blockade Runners
-            12733, 12735,                               # Deep Space Transports
-            20183, 20185, 20187, 20189,                 # Freighters
-            28846, 28848, 28850, 28852,                 # Jump Freighters
+        "group_ids": {
+            28,    # Hauler               — T1 Industrials (Badger, Mammoth, Iteron Mk V …)
+            380,   # Deep Space Transport — Impel, Bustard, Occator, Mastodon
+            1202,  # Blockade Runner      — Crane, Prorator, Viator, Prowler (+Meridian 81046)
+            513,   # Freighter            — Charon, Providence, Obelisk, Fenrir (+faction)
+            902,   # Jump Freighter       — Rhea, Ark, Anshar, Nomad
         },
+        "type_ids": set(),
     },
     "mining": {
         "label": "Mining",
         "emoji": "⛏️",
+        "group_ids": {
+            463,   # Mining Barge             — Covetor, Retriever, Procurer
+            543,   # Exhumer                  — Hulk, Mackinaw, Skiff
+            1283,  # Expedition Frigate        — Prospect, Endurance (NOT Venture)
+            941,   # Industrial Command Ship  — Porpoise, Orca
+            883,   # Capital Industrial Ship  — Rorqual
+        },
         "type_ids": {
-            17476, 17478, 17480,                        # Mining Barges: Covetor, Retriever, Procurer
-            22544, 22548, 22546,                        # Exhumers: Hulk, Mackinaw, Skiff
-            32880, 33697, 37135, 89649, 89647,          # Mining Frigates: Venture, Prospect, Endurance, Outrider, Pioneer Consortium Issue
-            42244, 28606, 28352,                        # Industrial Command: Porpoise, Orca, Rorqual
-            2998,                                       # Salvager: Noctis
+            32880,  # Venture      (group 25 = Mining Frigates — too broad)
+            89649,  # Outrider     (no dedicated group)
+            89647,  # Pioneer Consortium Issue (no dedicated group)
+            2998,   # Noctis       (salvager; group 28 covers it only if industrial also selected)
         },
     },
     "exploration": {
         "label": "Exploration",
         "emoji": "🔭",
+        "group_ids": {
+            830,   # Covert Ops Frigate — Buzzard, Anathema, Helios, Cheetah
+            963,   # Strategic Cruiser  — Tengu, Legion, Proteus, Loki
+        },
         "type_ids": {
-            11188, 11192, 11182, 11172, 11184, 11186,  # Covert Ops frigates
-            29984, 29986, 29988, 29990,                 # T3 Cruisers (Legion, Proteus, Tengu, Loki)
-            11174, 11176, 11178, 11196,                 # Expedition Frigates (Astero equiv class)
-            37482,                                      # Astero
-            35779,                                      # Stratios
+            37482,                      # Astero
+            35779,                      # Stratios
+            11174, 11176, 11178, 11196, # Expedition Frigates
         },
     },
     "capital": {
         "label": "Capital Ships",
         "emoji": "🚀",
-        "type_ids": {
-            # Carriers
-            23757, 24483, 23911, 22852,
-            # Dreadnoughts
-            19720, 19722, 19724, 19726,
-            # Force Auxiliaries
-            37604, 37605, 37606, 37607,
-            # Supercarriers
-            3514, 23919, 23917, 42126,
-            # Titans
-            671, 11567, 23773, 45649,
+        "group_ids": {
+            547,   # Carrier
+            485,   # Dreadnought
+            1538,  # Force Auxiliary
+            659,   # Supercarrier
+            30,    # Titan
         },
+        "type_ids": set(),
     },
     "pvp_cruiser": {
         "label": "PvP Cruisers & BCs",
         "emoji": "⚔️",
-        "type_ids": {
-            # Heavy Assault Cruisers
-            12003, 12005, 12017, 12019, 11993, 11999, 12009, 12011,
-            # Command Ships / Battlecruisers
-            22442, 22448, 22474, 22466, 22452, 22456, 22460, 22464,
-            # Recon Ships
-            11957, 11963, 11959, 11961, 11971, 11965, 11969, 11975,
+        "group_ids": {
+            358,   # Heavy Assault Cruiser
+            540,   # Command Ship
+            833,   # Force Recon Ship
+            906,   # Combat Recon Ship
         },
+        "type_ids": set(),
     },
 }
 
@@ -220,7 +224,7 @@ async def fetch_region_kills(
         all_kills.extend(data)
         print(f"    Page {page}: +{len(data)} kills")
 
-        if len(data) < 100:
+        if len(data) < 200:
             break
 
         page += 1
@@ -241,16 +245,41 @@ async def _fetch_ship_region(
         kills = []
         page  = 1
         while page <= MAX_PAGE:
-            url  = f"{ZKILL_BASE}/ship/{type_id}/regionID/{region_id}/pastSeconds/{past_seconds}/page/{page}/"
+            url  = f"{ZKILL_BASE}/shipID/{type_id}/regionID/{region_id}/pastSeconds/{past_seconds}/page/{page}/"
             data = await fetch_json(client, url, delay=0)  # delay handled below
             await asyncio.sleep(REQUEST_DELAY)              # always delay — even on 404/error
             if not isinstance(data, list) or not data:
                 break
             kills.extend(data)
-            if len(data) < 100:
+            if len(data) < 200:
                 break
             page += 1
         return type_id, kills
+
+# ── Step 2c: Fetch kills for one group + region (group-filter path) ──────────
+
+async def _fetch_group_region(
+    client: httpx.AsyncClient,
+    group_id: int,
+    region_id: int,
+    past_seconds: int,
+    semaphore: asyncio.Semaphore,
+) -> list[dict]:
+    """Returns kills using zkill's built-in group filter."""
+    async with semaphore:
+        kills = []
+        page  = 1
+        while page <= MAX_PAGE:
+            url  = f"{ZKILL_BASE}/groupID/{group_id}/regionID/{region_id}/pastSeconds/{past_seconds}/page/{page}/"
+            data = await fetch_json(client, url, delay=0)
+            await asyncio.sleep(REQUEST_DELAY)
+            if not isinstance(data, list) or not data:
+                break
+            kills.extend(data)
+            if len(data) < 200:
+                break
+            page += 1
+        return kills
 
 # ── Step 3: Fetch full killmail + resolve pilot name ─────────────────────────
 
@@ -374,20 +403,22 @@ async def fetch_all_kills(
                        Pass None or empty list to match ALL ships.
         past_seconds:  time window in seconds (must be multiple of 3600, max 604800).
     """
-    # Build the combined type ID set from selected categories
+    # Build group and type pairs from selected categories
+    group_pairs: list[tuple[int, int]] = []
+    type_pairs:  list[tuple[int, int]] = []
+
     if category_keys:
-        target_ids: set[int] = set()
         for key in category_keys:
-            cat = SHIP_CATEGORIES.get(key)
-            if cat:
-                target_ids |= cat["type_ids"]
-    else:
-        target_ids = set()  # empty = no filter (all ships)
+            cat = SHIP_CATEGORIES.get(key, {})
+            for gid in cat.get("group_ids", set()):
+                group_pairs.append((gid, 0))   # region added after discovery
+            for tid in cat.get("type_ids", set()):
+                type_pairs.append((tid, 0))
 
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
         regions = await get_nulllow_regions(client)
 
-        if not target_ids:
+        if not category_keys:
             # ── Unfiltered path: fetch all kills per region ───────────────────
             raw_killmails: list[dict] = []
             seen_ids: set[int] = set()
@@ -403,32 +434,63 @@ async def fetch_all_kills(
             print(f"\nNo ship filter applied — returning all {len(raw_killmails)} kills.")
             return raw_killmails
 
-        # ── Filtered path: zkill ship-type filter → ESI killmail → bulk names ─
+        # ── Filtered path: zkill group/ship filter → ESI killmail → bulk names ─
         if on_progress:
             await on_progress({"phase": "regions", "count": len(regions)})
 
-        pairs       = [(type_id, region_id) for type_id in target_ids for region_id in regions]
-        total_tasks = len(pairs)
+        # Expand placeholder region (0) now that we have the real list
+        group_pairs_full = [(gid, rid) for gid, _ in group_pairs for rid in regions]
+        type_pairs_full  = [(tid, rid) for tid, _ in type_pairs  for rid in regions]
+        total_tasks = len(group_pairs_full) + len(type_pairs_full)
         done_count  = 0
 
-        print(f"\nFetching {len(target_ids)} ship type(s) across {len(regions)} regions sequentially ({total_tasks} requests)...")
+        n_groups = len({gid for gid, _ in group_pairs_full})
+        n_types  = len({tid for tid, _ in type_pairs_full})
+        print(f"\nFetching {n_groups} group(s) + {n_types} individual type(s) across {len(regions)} regions "
+              f"({total_tasks} requests)...")
         if on_progress:
-            await on_progress({"phase": "zkill_start", "types": len(target_ids), "regions": len(regions)})
+            await on_progress({"phase": "zkill_start", "types": total_tasks, "regions": len(regions)})
 
         semaphore    = asyncio.Semaphore(ZKILL_CONCURRENCY)
         seen_ids:    set[int]   = set()
         matched_raw: list[dict] = []
 
         # Sequential iteration — avoids background tasks outliving the httpx client
-        for type_id, region_id in pairs:
-            _, kills = await _fetch_ship_region(client, type_id, region_id, past_seconds, semaphore)
+        for group_id, region_id in group_pairs_full:
+            kills = await _fetch_group_region(client, group_id, region_id, past_seconds, semaphore)
             done_count += 1
+            new_hits = sum(1 for k in kills if k.get("killmail_id") not in seen_ids)
             for k in kills:
                 kid = k.get("killmail_id")
                 if kid and kid not in seen_ids:
                     seen_ids.add(kid)
-                    k["_ship_type_id"] = type_id
                     matched_raw.append(k)
+            if new_hits:
+                print(f"  [{done_count}/{total_tasks}] groupID {group_id} / region {region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
+            elif done_count % 50 == 0:
+                print(f"  [{done_count}/{total_tasks}] still scanning... ({len(matched_raw)} hits so far)")
+            if on_progress and (done_count % 20 == 0 or done_count == total_tasks):
+                await on_progress({
+                    "phase": "zkill_progress",
+                    "done":  done_count,
+                    "total": total_tasks,
+                    "found": len(matched_raw),
+                })
+
+        for type_id, region_id in type_pairs_full:
+            _, kills = await _fetch_ship_region(client, type_id, region_id, past_seconds, semaphore)
+            done_count += 1
+            new_hits = 0
+            for k in kills:
+                kid = k.get("killmail_id")
+                if kid and kid not in seen_ids:
+                    seen_ids.add(kid)
+                    matched_raw.append(k)
+                    new_hits += 1
+            if new_hits:
+                print(f"  [{done_count}/{total_tasks}] shipID {type_id} / region {region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
+            elif done_count % 50 == 0:
+                print(f"  [{done_count}/{total_tasks}] still scanning... ({len(matched_raw)} hits so far)")
             if on_progress and (done_count % 20 == 0 or done_count == total_tasks):
                 await on_progress({
                     "phase": "zkill_progress",
@@ -468,7 +530,7 @@ async def fetch_all_kills(
             enriched.append({
                 "killmail_id":     killmail_id,
                 "hash":            km_hash,
-                "ship_type_id":    k["_ship_type_id"],
+                "ship_type_id":    victim.get("ship_type_id", 0),
                 "character_id":    character_id,
                 "solar_system_id": full.get("solar_system_id"),
                 "killmail_time":   full.get("killmail_time"),
