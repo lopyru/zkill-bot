@@ -4,17 +4,19 @@ A Discord bot that fetches EVE Online killmail data from [zKillboard](https://zk
 
 ## Features
 
-- `/kills` — Interactive filter form (ship categories + time range) that posts a kill report embed to the channel
+- `/kills` — Interactive filter form (ship categories + time range) with a live terminal-style progress display; posts a kill report embed plus a copyable pilot list
 - `/ping` — Health check
 - **Automatic daily summary** — Posts a scheduled kill report to a configured channel every 24 hours
-- Tracks: total kills, total ISK destroyed, and up to 10 kills with pilot names and zKillboard links
+- Tracks: total kills, total ISK destroyed, up to 10 kills with pilot names and zKillboard links
+- **Copyable pilot list** — After each report, posts a code-block list of all pilot names ready to paste into an EVE in-game mail
+- **Friendly-fire exclusion** — Kills where the victim belongs to your own alliance or corporation are silently dropped, so your recruiter only sees actual recruitment targets
 
 ## Ship Categories
 
 | Key | Label | Ships included |
 |---|---|---|
 | `industrial` | Industrial & Hauling | T1 Industrials, Blockade Runners, Deep Space Transports, Freighters, Jump Freighters |
-| `mining` | Mining | Mining Barges, Exhumers, Mining Frigates (Venture/Prospect/Endurance/Outrider/Pioneer Consortium Issue), Porpoise, Orca, Rorqual, Noctis |
+| `mining` | Mining | Mining Barges (Covetor/Retriever/Procurer), Exhumers (Hulk/Mackinaw/Skiff), Mining Frigates (Venture/Prospect/Endurance/Outrider/Pioneer Consortium Issue), Porpoise, Orca, Rorqual, Noctis |
 | `exploration` | Exploration | Covert Ops Frigates, T3 Cruisers, Expedition Frigates, Astero, Stratios |
 | `capital` | Capital Ships | Carriers, Dreadnoughts, Force Auxiliaries, Supercarriers, Titans |
 | `pvp_cruiser` | PvP Cruisers & BCs | Heavy Assault Cruisers, Command Ships, Recon Ships |
@@ -48,6 +50,15 @@ AUTO_POST_CHANNEL_ID = 987654321098765432   # Channel for the daily auto-post (0
 AUTO_POST_CATEGORIES = ["industrial", "mining"]
 AUTO_POST_TIME_KEY   = "24h"
 ```
+
+To exclude kills where the victim is in your own alliance or corporation (so they don't appear in the recruiter's pilot list), add these to `.env`:
+
+```env
+EXCLUDED_ALLIANCE_IDS=99014523
+EXCLUDED_CORP_IDS=98765432,98765433
+```
+
+Both accept comma-separated IDs. Omit or leave blank to disable the filter.
 
 ### Run
 
@@ -84,9 +95,9 @@ zkill-bot/
 ## How the fetch pipeline works
 
 1. **Discover regions** — Queries ESI for all k-space regions, samples one system per region to determine security status, and caches the resulting NullSec/LowSec region list for the lifetime of the process.
-2. **Fetch matching kills** — For each selected ship type ID × NullSec/LowSec region, queries zKillboard's ship-filter endpoint (`/api/ship/{typeID}/regionID/{regionID}/...`). Requests run in parallel (up to 5 concurrent) so only kills matching the chosen ship types are returned — no bulk ESI killmail scanning required.
-3. **Enrich** — Fetches the full ESI killmail for each matched kill to retrieve the victim's character ID, then resolves all pilot names in a single bulk POST to `/universe/names/`.
-4. **Rate limiting** — 1 s delay between zKillboard requests; 200 ms between ESI requests; automatic `Retry-After` backoff on HTTP 429 responses (up to 4 retries).
+2. **Fetch matching kills** — For each selected ship type ID × NullSec/LowSec region, queries zKillboard's ship-filter endpoint (`/api/ship/{typeID}/regionID/{regionID}/...`). Requests are serialized (1 per second) so only kills matching the chosen ship types are returned — no bulk ESI killmail scanning required.
+3. **Enrich** — Fetches the full ESI killmail for each matched kill to retrieve the victim's character ID, alliance, and corporation; filters out victims from excluded alliances or corporations; then resolves all remaining pilot names in a single bulk POST to `/universe/names/`.
+4. **Rate limiting** — Strictly 1 req/s to zKillboard (delay applied even on 404 responses); 500 ms between ESI requests; minimum 30 s backoff on HTTP 429; ESI error budget monitored via `X-ESI-Error-Limit-Remain` (pauses 10 s if < 20 remaining).
 
 ## Time ranges
 

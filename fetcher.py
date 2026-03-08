@@ -5,7 +5,11 @@ Async, using httpx. Accepts dynamic ship type sets and time ranges.
 
 import asyncio
 import json
+import os
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 USER_AGENT    = "zkill-nulllow-fetcher/1.0 maintainer@example.com"
@@ -16,6 +20,15 @@ ZKILL_CONCURRENCY = 1     # serialize all zKill requests — their limit is ~1 r
 
 ZKILL_BASE = "https://zkillboard.com/api"
 ESI_BASE   = "https://esi.evetech.net/latest"
+
+# Alliance / corp IDs whose members should be excluded from results (e.g. your own)
+# Set as comma-separated lists in .env, e.g.: EXCLUDED_ALLIANCE_IDS=99014523,99005065
+EXCLUDED_ALLIANCE_IDS: set[int] = {
+    int(x) for x in os.getenv("EXCLUDED_ALLIANCE_IDS", "").split(",") if x.strip()
+}
+EXCLUDED_CORP_IDS: set[int] = {
+    int(x) for x in os.getenv("EXCLUDED_CORP_IDS", "").split(",") if x.strip()
+}
 
 # Module-level cache so NullSec/LowSec region IDs are only discovered once per process
 _nulllow_regions_cache: list[int] | None = None
@@ -448,6 +461,10 @@ async def fetch_all_kills(
                 continue
 
             victim       = full.get("victim", {})
+            if (victim.get("alliance_id") in EXCLUDED_ALLIANCE_IDS
+                    or victim.get("corporation_id") in EXCLUDED_CORP_IDS):
+                continue
+
             character_id = victim.get("character_id")
             char_ids.append(character_id or 0)
 
