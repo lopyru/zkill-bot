@@ -54,7 +54,7 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
         description=(
             f"**📁 {cat_names}**\n"
             f"⏱ {time_label}\n"
-            f"🌌 Security\n"
+            f"🌌 **Security**\n"
             + " ".join(v for s, v in _SPACE.items() if s in present)
         ),
         color=discord.Color.red(),
@@ -377,11 +377,19 @@ class KillFilterView(discord.ui.View):
                         await channel.send(content=d_header, file=discord.File(buf, filename="kills.txt"))
 
                 # ── Comma-separated pilot names for in-game mail ──────────────
-                names = [k.get("pilot_name") for k in kills
-                         if k.get("pilot_name") not in (None, "Unknown", "Unknown (NPC)")]
-                if names:
-                    seen: set[str] = set()
-                    unique_names = [n for n in names if not (n in seen or seen.add(n))]
+                seen_cids: set[int] = set()
+                unique_pilots: list[dict] = []
+                for k in kills:
+                    cid   = k.get("character_id")
+                    pilot = k.get("pilot_name", "")
+                    if not cid or not pilot or pilot in ("Unknown", "Unknown (NPC)"):
+                        continue
+                    if cid not in seen_cids:
+                        seen_cids.add(cid)
+                        unique_pilots.append({"name": pilot, "cid": cid})
+
+                if unique_pilots:
+                    unique_names = [p["name"] for p in unique_pilots]
                     comma_list = ", ".join(unique_names)
                     m_header = f"📮 **In-game mail list** ({len(unique_names)} pilots):\n"
                     if len(comma_list) <= 1800:
@@ -389,6 +397,19 @@ class KillFilterView(discord.ui.View):
                     else:
                         buf = io.BytesIO(comma_list.encode("utf-8"))
                         await channel.send(content=m_header, file=discord.File(buf, filename="pilot_names.txt"))
+
+                    # ── EVE in-game mail body format (showinfo links) ─────────
+                    eve_links = "".join(
+                        f'<a href="showinfo:1375//{p["cid"]}">{p["name"]}</a><br>'
+                        for p in unique_pilots
+                    )
+                    eve_body = f'<font size="14" color="#ffd98d00">{eve_links}</font>'
+                    e_header = f"📨 **EVE mail body** ({len(unique_pilots)} pilots):\n"
+                    if len(eve_body) <= 1800:
+                        await channel.send(content=f"{e_header}```\n{eve_body}\n```")
+                    else:
+                        buf = io.BytesIO(eve_body.encode("utf-8"))
+                        await channel.send(content=e_header, file=discord.File(buf, filename="eve_mail.txt"))
 
                 await status_msg.edit(content="✅ Done!")
         except Exception as e:
@@ -483,6 +504,26 @@ async def daily_kill_summary():
 @daily_kill_summary.before_loop
 async def before_daily():
     await bot.wait_until_ready()
+
+# ── Graceful shutdown notice ──────────────────────────────────────────────────
+
+_original_close = bot.close
+
+async def _close_with_notice():
+    if AUTO_POST_CHANNEL_ID:
+        channel = bot.get_channel(AUTO_POST_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                description="🔴 **zKill Bot is going offline.**",
+                color=discord.Color.dark_red(),
+            )
+            try:
+                await channel.send(embed=embed)
+            except Exception:
+                pass
+    await _original_close()
+
+bot.close = _close_with_notice
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 

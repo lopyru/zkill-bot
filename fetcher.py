@@ -35,6 +35,9 @@ EXCLUDED_CORP_IDS: set[int] = {
 # Keys: "nullsec", "lowsec", "wormhole"
 _region_cache: dict[str, list[int]] | None = None
 
+# Cache ship type_id → group_id so repeated scans don't re-fetch the same types
+_type_group_cache: dict[int, int] = {}
+
 HEADERS = {
     "Accept-Encoding": "gzip",
     "User-Agent": USER_AGENT,
@@ -392,6 +395,22 @@ async def resolve_type_names(client: httpx.AsyncClient, type_ids: list[int]) -> 
         print(f"  Error resolving type names: {e}")
     return name_map
 
+async def get_type_group(client: httpx.AsyncClient, type_id: int) -> int | None:
+    """Return the group_id for a ship type, using a process-lifetime cache."""
+    if type_id in _type_group_cache:
+        return _type_group_cache[type_id]
+    data = await fetch_json(
+        client,
+        f"{ESI_BASE}/universe/types/{type_id}/?datasource=tranquility",
+        delay=ESI_DELAY,
+    )
+    if data:
+        group_id = data.get("group_id")
+        if group_id:
+            _type_group_cache[type_id] = group_id
+            return group_id
+    return None
+
 # ── Step 4: Filter + enrich ───────────────────────────────────────────────────
 
 async def enrich_kills(
@@ -490,6 +509,10 @@ async def fetch_all_kills(
         group_to_cat    = {gid: key for key, cat in SHIP_CATEGORIES.items() for gid in cat.get("group_ids", set())}
         type_to_cat     = {tid: key for key, cat in SHIP_CATEGORIES.items() for tid in cat.get("type_ids", set())}
         region_to_space = {rid: t for t in ("nullsec", "lowsec", "wormhole") for rid in region_map[t]}
+
+        # Valid ship sets for ESI-side validation (filtered path only)
+        valid_group_ids = {gid for key in (category_keys or []) for gid in SHIP_CATEGORIES.get(key, {}).get("group_ids", set())}
+        valid_type_ids  = {tid for key in (category_keys or []) for tid in SHIP_CATEGORIES.get(key, {}).get("type_ids", set())}
 
         if not category_keys:
             # ── Unfiltered path: fetch all kills per region ───────────────────
@@ -611,6 +634,16 @@ async def fetch_all_kills(
             if (victim.get("alliance_id") in EXCLUDED_ALLIANCE_IDS
                     or victim.get("corporation_id") in EXCLUDED_CORP_IDS):
                 continue
+
+            # ESI-side category validation: confirm victim's ship actually belongs
+            # to the selected categories (zKillboard filtering is best-effort).
+            if category_keys:
+                ship_tid = victim.get("ship_type_id", 0)
+                if ship_tid and ship_tid not in valid_type_ids:
+                    ship_group = await get_type_group(client, ship_tid)
+                    if ship_group not in valid_group_ids:
+                        print(f"  ⚠ Kill {killmail_id}: ship {ship_tid} (group {ship_group}) not in selected categories — skipped")
+                        continue
 
             character_id = victim.get("character_id")
             char_ids.append(character_id or 0)
