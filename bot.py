@@ -46,15 +46,16 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
     unique_pilots = len({k.get("pilot_name") for k in kills
                          if k.get("pilot_name") not in (None, "Unknown", "Unknown (NPC)")})
 
-    _SPACE = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole"}
-    present     = {k.get("space_type") for k in kills if k.get("space_type")}
-    space_label = " · ".join(v for s, v in _SPACE.items() if s in present) or "⚫ Null Sec · 🔴 Low Sec"
+    _SPACE  = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole"}
+    present = {k.get("space_type") for k in kills if k.get("space_type")}
 
     embed = discord.Embed(
         title="Pilots deaths report ready! ✅",
         description=(
             f"**📁 {cat_names}**\n"
-            f"⏱ {time_label}  ·  🌌 {space_label}"
+            f"⏱ {time_label}\n"
+            f"🌌 Security\n"
+            + " ".join(v for s, v in _SPACE.items() if s in present)
         ),
         color=discord.Color.red(),
     )
