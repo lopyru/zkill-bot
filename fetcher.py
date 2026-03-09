@@ -115,10 +115,6 @@ SHIP_CATEGORIES: dict[str, dict] = {
 
 # ── Time range options ────────────────────────────────────────────────────────
 TIME_RANGES: dict[str, dict] = {
-    "1m":  {"label": "Last 1 minute",  "seconds": 60},
-    "2m":  {"label": "Last 2 minutes", "seconds": 120},
-    "5m":  {"label": "Last 5 minutes", "seconds": 300},
-    "10m": {"label": "Last 10 minutes","seconds": 600},
     "15m": {"label": "Last 15 minutes","seconds": 900},
     "30m": {"label": "Last 30 minutes","seconds": 1800},
     "1h":  {"label": "Last 1 hour",    "seconds": 3600},
