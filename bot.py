@@ -2,6 +2,8 @@
 bot.py — py-cord Discord bot with interactive filter form.
 """
 
+import asyncio
+import collections
 import io
 import os
 import time as _time
@@ -234,9 +236,10 @@ class KillFilterView(discord.ui.View):
             "esi":     "[ ] Pending kill data",
             "names":   "[ ] Pending ESI enrichment",
         }
-        last_edit   = [0.0]
+        log_buffer  = collections.deque(maxlen=6)
         start_ts    = [_time.monotonic()]
         est_seconds = [0]
+        _loop_stop  = [False]
 
         def _bar(done: int, total: int) -> str:
             if total == 0:
@@ -258,16 +261,19 @@ class KillFilterView(discord.ui.View):
         def build_status() -> str:
             sep = "─" * 48
             eta = f"  (est. {_fmt_est(est_seconds[0])})" if est_seconds[0] else ""
+            log_lines = "\n".join(log_buffer) if log_buffer else "  (waiting for activity...)"
             return (
                 f"```\n"
-                f"Categories  {cat_label[:36]}\n"
-                f"Time range  {time_label}\n"
-                f"Security    {space_label}\n"
+                f"Categories:  {cat_label[:36]}\n"
+                f"Time range:  {time_label}\n"
+                f"Security:    {space_label}\n"
                 f"{sep}\n"
                 f"Regions     {stages['regions']}\n"
                 f"zKillboard  {stages['zkill']}\n"
                 f"ESI         {stages['esi']}\n"
                 f"Names       {stages['names']}\n"
+                f"{sep}\n"
+                f"{log_lines}\n"
                 f"{sep}\n"
                 f"Elapsed     {_elapsed()}{eta}\n"
                 f"```"
@@ -278,6 +284,16 @@ class KillFilterView(discord.ui.View):
             content=f"🔍 Fetching… see progress in <#{channel.id}>", view=None
         )
         status_msg = await channel.send(content=build_status())
+
+        async def _edit_loop():
+            while not _loop_stop[0]:
+                await asyncio.sleep(0.5)
+                try:
+                    await status_msg.edit(content=build_status())
+                except Exception:
+                    pass
+
+        loop_task = asyncio.ensure_future(_edit_loop())
 
         async def on_progress(event: dict):
             phase = event.get("phase")
@@ -302,15 +318,8 @@ class KillFilterView(discord.ui.View):
                 stages["esi"]   = stages["esi"].replace("[~]", "[✓]")
                 stages["names"] = "[~] Resolving pilot names & ship types..."
 
-            # Throttle Discord edits to ~1 per 2 seconds
-            now = _time.monotonic()
-            if now - last_edit[0] < 2.0:
-                return
-            last_edit[0] = now
-            try:
-                await status_msg.edit(content=build_status())
-            except Exception:
-                pass
+        async def on_log(line: str):
+            log_buffer.append(line)
 
         try:
             kills = await fetch_all_kills(
@@ -318,13 +327,22 @@ class KillFilterView(discord.ui.View):
                 past_seconds=past_seconds,
                 space_types=self.selected_space,
                 on_progress=on_progress,
+                on_log=on_log,
             )
-            embed = build_summary_embed(kills, self.selected_categories, time_key)
-            # Fix #4: tag the caller when results are ready
-            await channel.send(content=f"{caller.mention} — kill report ready!", embed=embed)
+            if not kills:
+                await channel.send(
+                    content=(
+                        f"{caller.mention} — no kills found for **{cat_label}** "
+                        f"in the last **{time_label}** in **{space_label}**."
+                    )
+                )
+                await status_msg.edit(content="✅ Done — no results.")
+            else:
+                embed = build_summary_embed(kills, self.selected_categories, time_key)
+                # Fix #4: tag the caller when results are ready
+                await channel.send(content=f"{caller.mention} — kill report ready!", embed=embed)
 
-            # ── Detailed kill list (pilot | ship | ISK | link) ────────────────
-            if kills:
+                # ── Detailed kill list (pilot | ship | ISK | link) ────────────
                 detail_lines = []
                 for k in kills:
                     pilot = k.get("pilot_name", "")
@@ -336,12 +354,25 @@ class KillFilterView(discord.ui.View):
                     detail_lines.append(f"{pilot} | {ship} | {isk:.0f}M ISK | {url}")
 
                 if detail_lines:
-                    detail_block = "\n".join(detail_lines)
-                    d_header = f"📋 **Kill details** ({len(detail_lines)} kills):\n"
-                    if len(detail_block) <= 1800:
-                        await channel.send(content=f"{d_header}```\n{detail_block}\n```")
+                    # Use <url> format: clickable in Discord messages and suppresses link preview boxes
+                    md_lines = []
+                    for k in kills:
+                        pilot = k.get("pilot_name", "")
+                        if not pilot or pilot in ("Unknown", "Unknown (NPC)"):
+                            continue
+                        ship = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
+                        isk  = k.get("total_value", 0) / 1_000_000
+                        url  = k.get("zkill_url", "")
+                        md_lines.append(f"**{pilot}** — {ship} — {isk:.0f}M ISK — 🔗 <{url}>")
+
+                    d_header = f"📋 **Kill details** ({len(md_lines)} kills):\n"
+                    md_block = "\n".join(md_lines)
+                    if len(d_header) + len(md_block) <= 1900:
+                        await channel.send(content=f"{d_header}{md_block}")
                     else:
-                        buf = io.BytesIO(detail_block.encode("utf-8"))
+                        # Too long for one message — send as plain-text file (URLs still copyable)
+                        plain_block = "\n".join(detail_lines)
+                        buf = io.BytesIO(plain_block.encode("utf-8"))
                         await channel.send(content=d_header, file=discord.File(buf, filename="kills.txt"))
 
                 # ── Comma-separated pilot names for in-game mail ──────────────
@@ -358,10 +389,12 @@ class KillFilterView(discord.ui.View):
                         buf = io.BytesIO(comma_list.encode("utf-8"))
                         await channel.send(content=m_header, file=discord.File(buf, filename="pilot_names.txt"))
 
-            await status_msg.edit(content="✅ Done!")
+                await status_msg.edit(content="✅ Done!")
         except Exception as e:
             await status_msg.edit(content=f"❌ Fetch failed: `{e}`")
         finally:
+            _loop_stop[0] = True
+            loop_task.cancel()
             fetch_in_progress = False
 
     # ── Cancel button ─────────────────────────────────────────────────────────

@@ -451,6 +451,7 @@ async def fetch_all_kills(
     past_seconds: int = 86400,
     space_types: list[str] | None = None,  # subset of ["nullsec", "lowsec", "wormhole"]
     on_progress=None,                       # optional async callable: on_progress(dict) -> None
+    on_log=None,                            # optional async callable: on_log(str) -> None
 ) -> list[dict]:
     """
     Full pipeline with optional filters.
@@ -541,6 +542,8 @@ async def fetch_all_kills(
                     matched_raw.append(k)
             if new_hits:
                 print(f"  [{done_count}/{total_tasks}] groupID {group_id} / region {region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
+                if on_log:
+                    await on_log(f"[{done_count}/{total_tasks}] groupID {group_id} / r{region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
             elif done_count % 10 == 0:
                 print(f"  [{done_count}/{total_tasks}] still scanning... ({len(matched_raw)} hits so far)")
             if on_progress and (done_count % 20 == 0 or done_count == total_tasks):
@@ -565,6 +568,8 @@ async def fetch_all_kills(
                     new_hits += 1
             if new_hits:
                 print(f"  [{done_count}/{total_tasks}] shipID {type_id} / region {region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
+                if on_log:
+                    await on_log(f"[{done_count}/{total_tasks}] shipID {type_id} / r{region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
             elif done_count % 10 == 0:
                 print(f"  [{done_count}/{total_tasks}] still scanning... ({len(matched_raw)} hits so far)")
             if on_progress and (done_count % 20 == 0 or done_count == total_tasks):
@@ -610,6 +615,7 @@ async def fetch_all_kills(
             character_id = victim.get("character_id")
             char_ids.append(character_id or 0)
 
+            isk_m = zkb.get("totalValue", 0) / 1_000_000
             enriched.append({
                 "killmail_id":     killmail_id,
                 "hash":            km_hash,
@@ -625,6 +631,9 @@ async def fetch_all_kills(
                 "category":        k.get("_category"),
                 "space_type":      k.get("_space_type"),
             })
+            if on_log:
+                ts = (full.get("killmail_time") or "")[:16].replace("T", " ")
+                await on_log(f"  kill {killmail_id}  {isk_m:>8.0f}M ISK  {ts}")
 
             if on_progress and i % 5 == 0:
                 await on_progress({"phase": "esi", "done": i + 1, "total": len(matched_raw)})
@@ -650,6 +659,14 @@ async def fetch_all_kills(
             type_name_map = await resolve_type_names(client, ship_type_ids)
             for entry in enriched:
                 entry["ship_name"] = type_name_map.get(entry["ship_type_id"], "Unknown Ship")
+
+        # Log resolved kills (pilot + ship now both available)
+        if on_log:
+            for entry in enriched:
+                pilot = entry.get("pilot_name") or "Unknown"
+                ship  = entry.get("ship_name")  or f"typeID {entry['ship_type_id']}"
+                isk   = entry["total_value"] / 1_000_000
+                await on_log(f"  ✓ {pilot} — {ship} — {isk:.0f}M ISK")
 
         print(f"\n  {len(enriched)} kills enriched.")
         return enriched
