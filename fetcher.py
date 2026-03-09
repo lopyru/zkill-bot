@@ -471,6 +471,8 @@ async def fetch_all_kills(
     space_types: list[str] | None = None,  # subset of ["nullsec", "lowsec", "wormhole"]
     on_progress=None,                       # optional async callable: on_progress(dict) -> None
     on_log=None,                            # optional async callable: on_log(str) -> None
+    stop_event=None,                        # asyncio.Event — set to abort with no results
+    skip_event=None,                        # asyncio.Event — set to skip remaining scan and proceed to ESI
 ) -> list[dict]:
     """
     Full pipeline with optional filters.
@@ -553,6 +555,10 @@ async def fetch_all_kills(
 
         # Sequential iteration — avoids background tasks outliving the httpx client
         for group_id, region_id in group_pairs_full:
+            if stop_event and stop_event.is_set():
+                break
+            if skip_event and skip_event.is_set():
+                break
             kills = await _fetch_group_region(client, group_id, region_id, zkill_seconds, semaphore)
             done_count += 1
             new_hits = sum(1 for k in kills if k.get("killmail_id") not in seen_ids)
@@ -578,6 +584,10 @@ async def fetch_all_kills(
                 })
 
         for type_id, region_id in type_pairs_full:
+            if stop_event and stop_event.is_set():
+                break
+            if skip_event and skip_event.is_set():
+                break
             _, kills = await _fetch_ship_region(client, type_id, region_id, zkill_seconds, semaphore)
             done_count += 1
             new_hits = 0
@@ -602,6 +612,13 @@ async def fetch_all_kills(
                     "total": total_tasks,
                     "found": len(matched_raw),
                 })
+
+        if stop_event and stop_event.is_set():
+            print("  ⏹ Stop requested — aborting, no results will be posted.")
+            return []
+
+        if skip_event and skip_event.is_set():
+            print(f"  ⏭ Skip requested — proceeding with {len(matched_raw)} kills collected so far.")
 
         print(f"  {len(matched_raw)} matching kills from zKillboard.")
         if on_progress:

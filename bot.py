@@ -28,6 +28,9 @@ bot     = discord.Bot(intents=intents)
 
 fetch_in_progress = False
 _skip_first_daily = True   # skip the immediate fire on startup; run after first 24h interval
+_stop_event:  asyncio.Event | None = None   # set by /stop  — aborts scan, no results posted
+_skip_event:  asyncio.Event | None = None   # set by /skip  — skips remaining scan, posts partial results
+_fetch_phase: str = ""                      # "zkill" | "esi" | "names" | ""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -113,7 +116,7 @@ class KillFilterView(discord.ui.View):
 
     @discord.ui.select(
         placeholder="🚢  Choose ship categories…",
-        min_values=0,
+        min_values=1,
         max_values=len(SHIP_CATEGORIES),
         options=[
             discord.SelectOption(
@@ -132,9 +135,7 @@ class KillFilterView(discord.ui.View):
         for option in select.options:
             option.default = option.value in self.selected_categories
 
-        label = ", ".join(
-            SHIP_CATEGORIES[k]["label"] for k in self.selected_categories
-        ) or "All ships (no filter)"
+        label = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories)
         space_label = " + ".join({"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space"}[s] for s in self.selected_space)
         await interaction.response.edit_message(
             content=f"✅ Categories: **{label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n🌌 Space: **{space_label}**\n\nHit **Fetch** when ready.",
@@ -164,9 +165,7 @@ class KillFilterView(discord.ui.View):
         for option in select.options:
             option.default = option.value == self.selected_time_key
 
-        label = ", ".join(
-            SHIP_CATEGORIES[k]["label"] for k in self.selected_categories
-        ) or "All ships (no filter)"
+        label = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories) or "*(select categories above)*"
         space_label = " + ".join({"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space"}[s] for s in self.selected_space)
         await interaction.response.edit_message(
             content=f"✅ Categories: **{label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n🌌 Space: **{space_label}**\n\nHit **Fetch** when ready.",
@@ -192,7 +191,7 @@ class KillFilterView(discord.ui.View):
         for option in select.options:
             option.default = option.value in self.selected_space
 
-        cat_label   = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories) or "All ships (no filter)"
+        cat_label   = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories) or "*(select categories above)*"
         space_label = " + ".join(o.label for o in select.options if o.default)
         await interaction.response.edit_message(
             content=f"✅ Categories: **{cat_label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n🌌 Space: **{space_label}**\n\nHit **Fetch** when ready.",
@@ -205,25 +204,35 @@ class KillFilterView(discord.ui.View):
     async def fetch_button(
         self, _button: discord.ui.Button, interaction: discord.Interaction
     ):
-        global fetch_in_progress
+        global fetch_in_progress, _stop_event, _skip_event, _fetch_phase
 
-        # Fix #2: keep the form visible and send a separate ephemeral notice
         if fetch_in_progress:
-            await interaction.response.send_message(
-                "⚠️ A fetch is already in progress — please wait for it to finish.",
-                ephemeral=True,
+            cat_label_busy = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories) or "*(none)*"
+            space_label_busy = " + ".join(
+                {"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space"}[s]
+                for s in self.selected_space
+            )
+            await interaction.response.edit_message(
+                content=(
+                    f"⚠️ **A fetch is already in progress — please wait.**\n\n"
+                    f"✅ Categories: **{cat_label_busy}**\n"
+                    f"⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n"
+                    f"🌌 Space: **{space_label_busy}**\n\n"
+                    f"Your selections are saved. Hit **Fetch** again when the scan completes."
+                ),
+                view=self,
             )
             return
 
         fetch_in_progress = True
+        _stop_event  = asyncio.Event()
+        _skip_event  = asyncio.Event()
+        _fetch_phase = ""
         caller     = interaction.user
         channel    = interaction.channel
         time_key   = self.selected_time_key
         time_label = TIME_RANGES[time_key]["label"]
-        cat_label  = (
-            ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories)
-            or "All ships"
-        )
+        cat_label    = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories)
         past_seconds = TIME_RANGES[time_key]["seconds"]
         categories   = self.selected_categories or None
 
@@ -297,11 +306,13 @@ class KillFilterView(discord.ui.View):
         loop_task = asyncio.ensure_future(_edit_loop())
 
         async def on_progress(event: dict):
+            global _fetch_phase
             phase = event.get("phase")
             if phase == "regions":
                 stages["regions"] = f"[✓] {event['count']} regions classified"
                 stages["zkill"]   = "[~] Scanning ship kills across all selected regions..."
             elif phase == "zkill_start":
+                _fetch_phase = "zkill"
                 total = event["types"]
                 est_seconds[0] = total   # 1 req/s → total seconds
                 stages["zkill"] = f"[~] {_bar(0, total)}  0/{total}  — querying zKillboard"
@@ -309,6 +320,7 @@ class KillFilterView(discord.ui.View):
                 done, total, found = event["done"], event["total"], event["found"]
                 stages["zkill"] = f"[~] {_bar(done, total)}  {done}/{total}  ({found} hits)"
             elif phase == "zkill_done":
+                _fetch_phase = "esi"
                 found = event["found"]
                 stages["zkill"] = f"[✓] {found} kill{'s' if found != 1 else ''} matched"
                 stages["esi"]   = f"[~] {_bar(0, found)}  0/{found}  — fetching ESI killmails"
@@ -316,6 +328,7 @@ class KillFilterView(discord.ui.View):
                 done, total = event["done"], event["total"]
                 stages["esi"] = f"[~] {_bar(done, total)}  {done}/{total}  — enriching kills"
             elif phase == "names":
+                _fetch_phase = "names"
                 stages["esi"]   = stages["esi"].replace("[~]", "[✓]")
                 stages["names"] = "[~] Resolving pilot names & ship types..."
 
@@ -329,8 +342,13 @@ class KillFilterView(discord.ui.View):
                 space_types=self.selected_space,
                 on_progress=on_progress,
                 on_log=on_log,
+                stop_event=_stop_event,
+                skip_event=_skip_event,
             )
-            if not kills:
+            if _stop_event is not None and _stop_event.is_set():
+                await channel.send(f"⏹ **Scan stopped.** No results posted.")
+                await status_msg.edit(content="⏹ Stopped.")
+            elif not kills:
                 await channel.send(
                     content=(
                         f"{caller.mention} — no kills found for **{cat_label}** "
@@ -417,6 +435,9 @@ class KillFilterView(discord.ui.View):
         finally:
             _loop_stop[0] = True
             loop_task.cancel()
+            _stop_event  = None
+            _skip_event  = None
+            _fetch_phase = ""
             fetch_in_progress = False
 
     # ── Cancel button ─────────────────────────────────────────────────────────
@@ -453,22 +474,71 @@ async def on_ready():
 
 @bot.slash_command(
     guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
-    description="Fetch NullSec + LowSec killmails with custom filters",
+    description="Open the kill report filter form",
 )
-async def kills(ctx: discord.ApplicationContext):
+async def scan(ctx: discord.ApplicationContext):
     view = KillFilterView()
     await ctx.respond(
         content=(
             "**Kill Report Filters**\n"
-            "Select ship categories, time range, and space type, then hit **Fetch**.\n"
-            "Leave categories empty to fetch all ships.\n\n"
-            "✅ Categories: **All ships (no filter)**\n"
+            "Select at least one category, a time range, and a space type, then hit **Fetch**.\n\n"
+            "✅ Categories: *(required — select at least one)*\n"
             "⏱ Time range: **Last 24 hours**\n"
             "🌌 Space: **Null Security + Low Security**"
         ),
         view=view,
         ephemeral=True,
     )
+
+
+@bot.slash_command(
+    guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
+    description="Stop the current scan immediately — no results will be posted",
+)
+async def stop(ctx: discord.ApplicationContext):
+    if not fetch_in_progress or _stop_event is None:
+        await ctx.respond("⚠️ No scan is currently in progress.", ephemeral=True)
+        return
+    _stop_event.set()
+    await ctx.respond("⏹ **Stopping the current scan.** No results will be posted.")
+
+
+@bot.slash_command(
+    guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
+    description="Skip remaining zKillboard scanning and post results collected so far",
+)
+async def skip(ctx: discord.ApplicationContext):
+    if not fetch_in_progress or _skip_event is None:
+        await ctx.respond("⚠️ No scan is currently in progress.", ephemeral=True)
+        return
+    if _fetch_phase != "zkill":
+        phase_label = {"esi": "ESI enrichment", "names": "name resolution", "": "starting up"}.get(_fetch_phase, _fetch_phase)
+        await ctx.respond(
+            f"⚠️ `/skip` is only available during the zKillboard scanning phase (currently: **{phase_label}**).",
+            ephemeral=True,
+        )
+        return
+    _skip_event.set()
+    await ctx.respond("⏭ **Skipping remaining scan** — will process and post results collected so far.")
+
+
+@bot.slash_command(
+    guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
+    description="Show available commands",
+)
+async def help(ctx: discord.ApplicationContext):
+    embed = discord.Embed(
+        title="📖 zKill Bot — Commands",
+        description="Scans zKillboard for ship losses in NullSec, LowSec, and Wormhole space.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="🔍 /scan",  value="Open the kill report filter form.", inline=False)
+    embed.add_field(name="⏹ /stop",  value="Abort the current scan immediately. No results are posted.", inline=False)
+    embed.add_field(name="⏭ /skip",  value="Skip remaining zKillboard scanning and post partial results. Only usable during the scanning phase.", inline=False)
+    embed.add_field(name="🏓 /ping",  value="Check latency.", inline=False)
+    embed.add_field(name="📖 /help",  value="Show this message.", inline=False)
+    embed.set_footer(text="Data via zKillboard + ESI")
+    await ctx.respond(embed=embed, ephemeral=True)
 
 
 @bot.slash_command(
