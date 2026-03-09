@@ -38,6 +38,9 @@ _region_cache: dict[str, list[int]] | None = None
 # Cache ship type_id → group_id so repeated scans don't re-fetch the same types
 _type_group_cache: dict[int, int] = {}
 
+# Cache region name (lowercase) → region_id for the region filter feature
+_region_name_to_id: dict[str, int] = {}
+
 HEADERS = {
     "Accept-Encoding": "gzip",
     "User-Agent": USER_AGENT,
@@ -159,17 +162,20 @@ async def fetch_json(client: httpx.AsyncClient, url: str, delay: float = 0.0, _r
 
 # ── Step 1: Discover regions by security type ────────────────────────────────
 
-async def get_regions(client: httpx.AsyncClient) -> dict[str, list[int]]:
-    """Returns {"nullsec": [...], "lowsec": [...], "wormhole": [...]} cached for the process lifetime."""
-    global _region_cache
+async def get_regions(client: httpx.AsyncClient, on_log=None) -> dict[str, list[int]]:
+    """Returns {"nullsec": [...], "lowsec": [...], "wormhole": [...], "highsec": [...]} cached for the process lifetime."""
+    global _region_cache, _region_name_to_id
     if _region_cache is not None:
-        total = sum(len(v) for v in _region_cache.values())
-        print(f"Using cached region list ({total} regions: "
-              f"{len(_region_cache['nullsec'])} NS / {len(_region_cache['lowsec'])} LS / "
-              f"{len(_region_cache['wormhole'])} WH).")
+        msg = (f"Cached: {len(_region_cache['nullsec'])} NS · {len(_region_cache['lowsec'])} LS · "
+               f"{len(_region_cache['wormhole'])} WH · {len(_region_cache['highsec'])} HS regions")
+        print(msg)
+        if on_log:
+            await on_log(f"  {msg}")
         return _region_cache
 
     print("Fetching region list from ESI...")
+    if on_log:
+        await on_log("  Fetching region list from ESI...")
     all_regions = await fetch_json(client, f"{ESI_BASE}/universe/regions/?datasource=tranquility")
     if not all_regions:
         raise RuntimeError("Could not fetch region list from ESI.")
@@ -180,6 +186,7 @@ async def get_regions(client: httpx.AsyncClient) -> dict[str, list[int]]:
 
     nullsec: list[int] = []
     lowsec:  list[int] = []
+    highsec: list[int] = []
 
     for region_id in kspace:
         region_data = await fetch_json(
@@ -189,6 +196,10 @@ async def get_regions(client: httpx.AsyncClient) -> dict[str, list[int]]:
         )
         if not region_data:
             continue
+
+        region_name = region_data.get("name", "")
+        if region_name:
+            _region_name_to_id[region_name.lower()] = region_id
 
         constellation_ids = region_data.get("constellations", [])
         if not constellation_ids:
@@ -212,14 +223,19 @@ async def get_regions(client: httpx.AsyncClient) -> dict[str, list[int]]:
 
         sec = sys_data.get("security_status", 1.0)
         if sec < 0.0:
-            print(f"  + [NullSec] {region_data.get('name', region_id)} (sec={sec:.2f})")
+            print(f"  + [NullSec] {region_name or region_id} (sec={sec:.2f})")
             nullsec.append(region_id)
         elif sec < 0.45:
-            print(f"  + [LowSec ] {region_data.get('name', region_id)} (sec={sec:.2f})")
+            print(f"  + [LowSec ] {region_name or region_id} (sec={sec:.2f})")
             lowsec.append(region_id)
+        else:
+            highsec.append(region_id)   # ~27 regions; skip verbose print
 
-    print(f"\n  {len(nullsec)} NullSec, {len(lowsec)} LowSec, {len(wormhole)} Wormhole regions found.")
-    _region_cache = {"nullsec": nullsec, "lowsec": lowsec, "wormhole": wormhole}
+    summary = f"  {len(nullsec)} NS · {len(lowsec)} LS · {len(wormhole)} WH · {len(highsec)} HS regions classified"
+    print(f"\n{summary}")
+    if on_log:
+        await on_log(summary)
+    _region_cache = {"nullsec": nullsec, "lowsec": lowsec, "wormhole": wormhole, "highsec": highsec}
     return _region_cache
 
 # ── Step 2: Fetch kills per region ───────────────────────────────────────────
@@ -473,6 +489,9 @@ async def fetch_all_kills(
     on_log=None,                            # optional async callable: on_log(str) -> None
     stop_event=None,                        # asyncio.Event — set to abort with no results
     skip_event=None,                        # asyncio.Event — set to skip remaining scan and proceed to ESI
+    min_isk: float | None = None,           # skip kills with totalValue below this threshold
+    max_results: int | None = None,         # stop zKill scanning once this many raw kills are collected
+    region_filter: list[str] | None = None, # restrict scan to specific region names (case-insensitive)
 ) -> list[dict]:
     """
     Full pipeline with optional filters.
@@ -504,13 +523,25 @@ async def fetch_all_kills(
     selected_space = set(space_types) if space_types else {"nullsec", "lowsec"}
 
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
-        region_map = await get_regions(client)
-        regions = [r for t in ("nullsec", "lowsec", "wormhole") if t in selected_space for r in region_map[t]]
+        region_map = await get_regions(client, on_log=on_log)
+        regions = [r for t in ("nullsec", "lowsec", "wormhole", "highsec") if t in selected_space for r in region_map.get(t, [])]
+
+        # Apply optional region name filter
+        if region_filter:
+            filter_ids = {_region_name_to_id[n.lower()] for n in region_filter if n.lower() in _region_name_to_id}
+            unknown    = [n for n in region_filter if n.lower() not in _region_name_to_id]
+            if unknown:
+                print(f"  ⚠ Unknown region name(s) ignored: {', '.join(unknown)}")
+            if filter_ids:
+                regions = [r for r in regions if r in filter_ids]
+                print(f"  Region filter active: {len(regions)} region(s) selected ({', '.join(region_filter)})")
+            else:
+                print(f"  ⚠ Region filter matched nothing — scanning all selected space")
 
         # Reverse maps for tagging kills with category + space type
         group_to_cat    = {gid: key for key, cat in SHIP_CATEGORIES.items() for gid in cat.get("group_ids", set())}
         type_to_cat     = {tid: key for key, cat in SHIP_CATEGORIES.items() for tid in cat.get("type_ids", set())}
-        region_to_space = {rid: t for t in ("nullsec", "lowsec", "wormhole") for rid in region_map[t]}
+        region_to_space = {rid: t for t in ("nullsec", "lowsec", "wormhole", "highsec") for rid in region_map.get(t, [])}
 
         # Valid ship sets for ESI-side validation (filtered path only)
         valid_group_ids = {gid for key in (category_keys or []) for gid in SHIP_CATEGORIES.get(key, {}).get("group_ids", set())}
@@ -559,6 +590,9 @@ async def fetch_all_kills(
                 break
             if skip_event and skip_event.is_set():
                 break
+            if max_results and len(matched_raw) >= max_results:
+                print(f"  ⏹ Max results cap ({max_results}) reached — stopping zKill scan early.")
+                break
             kills = await _fetch_group_region(client, group_id, region_id, zkill_seconds, semaphore)
             done_count += 1
             new_hits = sum(1 for k in kills if k.get("killmail_id") not in seen_ids)
@@ -575,6 +609,8 @@ async def fetch_all_kills(
                     await on_log(f"[{done_count}/{total_tasks}] groupID {group_id} / r{region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
             elif done_count % 10 == 0:
                 print(f"  [{done_count}/{total_tasks}] still scanning... ({len(matched_raw)} hits so far)")
+                if on_log:
+                    await on_log(f"  [{done_count}/{total_tasks}] scanning...  ({len(matched_raw)} hit(s) so far)")
             if on_progress and (done_count % 20 == 0 or done_count == total_tasks):
                 await on_progress({
                     "phase": "zkill_progress",
@@ -587,6 +623,9 @@ async def fetch_all_kills(
             if stop_event and stop_event.is_set():
                 break
             if skip_event and skip_event.is_set():
+                break
+            if max_results and len(matched_raw) >= max_results:
+                print(f"  ⏹ Max results cap ({max_results}) reached — stopping zKill scan early.")
                 break
             _, kills = await _fetch_ship_region(client, type_id, region_id, zkill_seconds, semaphore)
             done_count += 1
@@ -605,6 +644,8 @@ async def fetch_all_kills(
                     await on_log(f"[{done_count}/{total_tasks}] shipID {type_id} / r{region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
             elif done_count % 10 == 0:
                 print(f"  [{done_count}/{total_tasks}] still scanning... ({len(matched_raw)} hits so far)")
+                if on_log:
+                    await on_log(f"  [{done_count}/{total_tasks}] scanning...  ({len(matched_raw)} hit(s) so far)")
             if on_progress and (done_count % 20 == 0 or done_count == total_tasks):
                 await on_progress({
                     "phase": "zkill_progress",
@@ -662,10 +703,14 @@ async def fetch_all_kills(
                         print(f"  ⚠ Kill {killmail_id}: ship {ship_tid} (group {ship_group}) not in selected categories — skipped")
                         continue
 
+            total_value = zkb.get("totalValue", 0)
+            if min_isk and total_value < min_isk:
+                continue
+
             character_id = victim.get("character_id")
             char_ids.append(character_id or 0)
 
-            isk_m = zkb.get("totalValue", 0) / 1_000_000
+            isk_m = total_value / 1_000_000
             enriched.append({
                 "killmail_id":     killmail_id,
                 "hash":            km_hash,
@@ -673,7 +718,7 @@ async def fetch_all_kills(
                 "character_id":    character_id,
                 "solar_system_id": full.get("solar_system_id"),
                 "killmail_time":   full.get("killmail_time"),
-                "total_value":     zkb.get("totalValue", 0),
+                "total_value":     total_value,
                 "points":          zkb.get("points", 0),
                 "zkill_url":       f"https://zkillboard.com/kill/{killmail_id}/",
                 "pilot_name":      None,  # filled below

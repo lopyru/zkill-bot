@@ -21,6 +21,8 @@ DEV_GUILD_ID         = 671707585262649344   # e.g. 123456789012345678 — set fo
 AUTO_POST_CHANNEL_ID = 1480291942389514370   # e.g. 987654321098765432 — set to enable daily auto-post
 AUTO_POST_CATEGORIES = ["industrial", "mining"]   # categories used by the daily auto-post
 AUTO_POST_TIME_KEY   = "24h"                       # time range key used by the daily auto-post
+MAX_SCAN_RESULTS: int | None = None                # cap zKillboard scanning early (e.g. 100); None = no cap
+HIGHSEC_MAX_RESULTS: int = 200                     # automatic cap when High Security space is selected
 
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -28,9 +30,11 @@ bot     = discord.Bot(intents=intents)
 
 fetch_in_progress = False
 _skip_first_daily = True   # skip the immediate fire on startup; run after first 24h interval
-_stop_event:  asyncio.Event | None = None   # set by /stop  — aborts scan, no results posted
-_skip_event:  asyncio.Event | None = None   # set by /skip  — skips remaining scan, posts partial results
-_fetch_phase: str = ""                      # "zkill" | "esi" | "names" | ""
+_stop_event:    asyncio.Event | None = None   # set by /stop  — aborts scan, no results posted
+_skip_event:    asyncio.Event | None = None   # set by /skip  — skips remaining scan, posts partial results
+_fetch_phase:   str = ""                      # "zkill" | "esi" | "names" | ""
+_fetch_start_ts: float | None = None          # monotonic timestamp when current fetch started
+_last_embed: discord.Embed | None = None      # embed from the most recent completed scan
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -49,7 +53,7 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
     unique_pilots = len({k.get("pilot_name") for k in kills
                          if k.get("pilot_name") not in (None, "Unknown", "Unknown (NPC)")})
 
-    _SPACE  = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole"}
+    _SPACE  = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole", "highsec": "🟡 High Sec"}
     present = {k.get("space_type") for k in kills if k.get("space_type")}
 
     embed = discord.Embed(
@@ -83,11 +87,11 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
 
     # Breakdown by security
     space_lines = []
-    for s_key in ("nullsec", "lowsec", "wormhole"):
+    for s_key in ("nullsec", "lowsec", "wormhole", "highsec"):
         s_kills = [k for k in kills if k.get("space_type") == s_key]
         if s_kills:
-            emoji = {"nullsec": "⚫", "lowsec": "🔴", "wormhole": "🌀"}[s_key]
-            label = {"nullsec": "Null Sec", "lowsec": "Low Sec", "wormhole": "Wormhole"}[s_key]
+            emoji = {"nullsec": "⚫", "lowsec": "🔴", "wormhole": "🌀", "highsec": "🟡"}[s_key]
+            label = {"nullsec": "Null Sec", "lowsec": "Low Sec", "wormhole": "Wormhole", "highsec": "High Sec"}[s_key]
             isk   = sum(k.get("total_value", 0) for k in s_kills)
             isk_s = f"{isk/1e9:.2f}B" if isk >= 1e9 else f"{isk/1e6:.0f}M"
             space_lines.append(f"{emoji} {label}: **{len(s_kills)}** kills · {isk_s} ISK")
@@ -96,6 +100,32 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
 
     embed.set_footer(text="Data via zKillboard + ESI")
     return embed
+
+# ── Region filter modal ───────────────────────────────────────────────────────
+
+class RegionModal(discord.ui.Modal):
+    """Opened by the Regions button — lets the user type region names."""
+
+    def __init__(self, view_ref, btn_interaction: discord.Interaction):
+        super().__init__(title="📍 Filter by Region")
+        self.view_ref       = view_ref
+        self.btn_interaction = btn_interaction
+        self.add_item(discord.ui.InputText(
+            label="Region names (comma-separated, blank = all)",
+            placeholder="e.g. Delve, Querious, The Bleak Lands",
+            style=discord.InputTextStyle.short,
+            required=False,
+            max_length=200,
+        ))
+
+    async def callback(self, interaction: discord.Interaction):
+        raw = self.children[0].value.strip()
+        self.view_ref.selected_regions = [r.strip() for r in raw.split(",") if r.strip()] if raw else []
+        await interaction.response.defer()
+        await self.btn_interaction.edit_original_response(
+            content=self.view_ref._form_content(), view=self.view_ref
+        )
+
 
 # ── Filter UI ─────────────────────────────────────────────────────────────────
 
@@ -111,6 +141,34 @@ class KillFilterView(discord.ui.View):
         self.selected_categories: list[str] = []
         self.selected_time_key: str         = "24h"
         self.selected_space:     list[str]  = ["nullsec", "lowsec"]
+        self.selected_min_isk:   int | None = None
+        self.selected_regions:   list[str]  = []
+
+    def _form_content(self) -> str:
+        cat_label = (
+            ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories)
+            or "*(required — select at least one)*"
+        )
+        time_label   = TIME_RANGES[self.selected_time_key]["label"]
+        space_label  = " + ".join(
+            {"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space", "highsec": "High Security"}[s]
+            for s in self.selected_space
+        )
+        isk_label    = f"{self.selected_min_isk // 1_000_000:,}M ISK" if self.selected_min_isk else "*(none)*"
+        region_label = ", ".join(self.selected_regions) if self.selected_regions else "*(all regions in selected space)*"
+        hs_warning   = (
+            f"\n⚠️ High Security selected — results capped at **{HIGHSEC_MAX_RESULTS}** kills to keep scan time reasonable."
+            if "highsec" in self.selected_space else ""
+        )
+        return (
+            f"✅ Categories: **{cat_label}**\n"
+            f"⏱ Time range: **{time_label}**\n"
+            f"🌌 Space: **{space_label}**\n"
+            f"💰 Min ISK: **{isk_label}**\n"
+            f"🗺️ Regions: **{region_label}**"
+            f"{hs_warning}\n\n"
+            "Hit **Fetch** when ready."
+        )
 
     # ── Ship category multi-select ────────────────────────────────────────────
 
@@ -135,12 +193,7 @@ class KillFilterView(discord.ui.View):
         for option in select.options:
             option.default = option.value in self.selected_categories
 
-        label = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories)
-        space_label = " + ".join({"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space"}[s] for s in self.selected_space)
-        await interaction.response.edit_message(
-            content=f"✅ Categories: **{label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n🌌 Space: **{space_label}**\n\nHit **Fetch** when ready.",
-            view=self,
-        )
+        await interaction.response.edit_message(content=self._form_content(), view=self)
 
     # ── Time range single-select ──────────────────────────────────────────────
 
@@ -165,23 +218,19 @@ class KillFilterView(discord.ui.View):
         for option in select.options:
             option.default = option.value == self.selected_time_key
 
-        label = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories) or "*(select categories above)*"
-        space_label = " + ".join({"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space"}[s] for s in self.selected_space)
-        await interaction.response.edit_message(
-            content=f"✅ Categories: **{label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n🌌 Space: **{space_label}**\n\nHit **Fetch** when ready.",
-            view=self,
-        )
+        await interaction.response.edit_message(content=self._form_content(), view=self)
 
     # ── Space type multi-select ───────────────────────────────────────────────
 
     @discord.ui.select(
         placeholder="🌌  Space type…",
         min_values=1,
-        max_values=3,
+        max_values=4,
         options=[
             discord.SelectOption(label="Null Security",  value="nullsec",  emoji="⚫", default=True),
             discord.SelectOption(label="Low Security",   value="lowsec",   emoji="🔴", default=True),
             discord.SelectOption(label="Wormhole Space", value="wormhole", emoji="🌀", default=False),
+            discord.SelectOption(label="High Security",  value="highsec",  emoji="🟡", default=False),
         ],
     )
     async def space_select(
@@ -191,12 +240,30 @@ class KillFilterView(discord.ui.View):
         for option in select.options:
             option.default = option.value in self.selected_space
 
-        cat_label   = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories) or "*(select categories above)*"
-        space_label = " + ".join(o.label for o in select.options if o.default)
-        await interaction.response.edit_message(
-            content=f"✅ Categories: **{cat_label}**\n⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n🌌 Space: **{space_label}**\n\nHit **Fetch** when ready.",
-            view=self,
-        )
+        await interaction.response.edit_message(content=self._form_content(), view=self)
+
+    # ── Min ISK filter single-select ──────────────────────────────────────────
+
+    @discord.ui.select(
+        placeholder="💰  Min ISK value… (optional)",
+        min_values=0,
+        max_values=1,
+        options=[
+            discord.SelectOption(label="10M ISK minimum",  value="10000000"),
+            discord.SelectOption(label="50M ISK minimum",  value="50000000"),
+            discord.SelectOption(label="100M ISK minimum", value="100000000"),
+            discord.SelectOption(label="250M ISK minimum", value="250000000"),
+            discord.SelectOption(label="500M ISK minimum", value="500000000"),
+            discord.SelectOption(label="1B ISK minimum",   value="1000000000"),
+        ],
+    )
+    async def min_isk_select(
+        self, select: discord.ui.Select, interaction: discord.Interaction
+    ):
+        self.selected_min_isk = int(select.values[0]) if select.values else None
+        for option in select.options:
+            option.default = bool(select.values) and option.value == select.values[0]
+        await interaction.response.edit_message(content=self._form_content(), view=self)
 
     # ── Fetch button ──────────────────────────────────────────────────────────
 
@@ -204,49 +271,50 @@ class KillFilterView(discord.ui.View):
     async def fetch_button(
         self, _button: discord.ui.Button, interaction: discord.Interaction
     ):
-        global fetch_in_progress, _stop_event, _skip_event, _fetch_phase
+        global fetch_in_progress, _stop_event, _skip_event, _fetch_phase, _fetch_start_ts, _last_embed
 
         if fetch_in_progress:
-            cat_label_busy = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories) or "*(none)*"
-            space_label_busy = " + ".join(
-                {"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space"}[s]
-                for s in self.selected_space
-            )
             await interaction.response.edit_message(
                 content=(
-                    f"⚠️ **A fetch is already in progress — please wait.**\n\n"
-                    f"✅ Categories: **{cat_label_busy}**\n"
-                    f"⏱ Time range: **{TIME_RANGES[self.selected_time_key]['label']}**\n"
-                    f"🌌 Space: **{space_label_busy}**\n\n"
-                    f"Your selections are saved. Hit **Fetch** again when the scan completes."
+                    "⚠️ **A fetch is already in progress — please wait.**\n\n"
+                    + self._form_content().replace("Hit **Fetch** when ready.", "Your selections are saved. Hit **Fetch** again when the scan completes.")
                 ),
                 view=self,
             )
             return
 
         fetch_in_progress = True
-        _stop_event  = asyncio.Event()
-        _skip_event  = asyncio.Event()
-        _fetch_phase = ""
-        caller     = interaction.user
-        channel    = interaction.channel
-        time_key   = self.selected_time_key
-        time_label = TIME_RANGES[time_key]["label"]
+        _stop_event    = asyncio.Event()
+        _skip_event    = asyncio.Event()
+        _fetch_phase   = ""
+        _fetch_start_ts = _time.monotonic()
+        caller       = interaction.user
+        channel      = interaction.channel
+        time_key     = self.selected_time_key
+        time_label   = TIME_RANGES[time_key]["label"]
         cat_label    = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories)
         past_seconds = TIME_RANGES[time_key]["seconds"]
-        categories   = self.selected_categories or None
+        categories     = self.selected_categories or None
+        min_isk        = self.selected_min_isk
+        region_filter  = self.selected_regions or None
+        max_results    = (
+            HIGHSEC_MAX_RESULTS if "highsec" in self.selected_space
+            else MAX_SCAN_RESULTS
+        )
 
         # ── Live progress state ───────────────────────────────────────────────
         W = 14  # progress bar width (chars)
-        _SPACE_LABELS = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole"}
-        space_label = " · ".join(_SPACE_LABELS[s] for s in self.selected_space if s in _SPACE_LABELS)
+        _SPACE_LABELS  = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole", "highsec": "🟡 High Sec"}
+        space_label    = " · ".join(_SPACE_LABELS[s] for s in self.selected_space if s in _SPACE_LABELS)
+        isk_label      = f"{min_isk // 1_000_000:,}M ISK" if min_isk else None
+        region_label   = ", ".join(region_filter) if region_filter else None
         stages = {
             "regions": "[ ] Classifying NS / LS / WH regions...",
             "zkill":   "[ ] Waiting for region list...",
             "esi":     "[ ] Pending kill data",
             "names":   "[ ] Pending ESI enrichment",
         }
-        log_buffer  = collections.deque(maxlen=6)
+        log_buffer  = collections.deque(["  ·", "  ·", "  ·"], maxlen=6)
         start_ts    = [_time.monotonic()]
         est_seconds = [0]
         _loop_stop  = [False]
@@ -271,12 +339,16 @@ class KillFilterView(discord.ui.View):
         def build_status() -> str:
             sep = "─" * 48
             eta = f"  (est. {_fmt_est(est_seconds[0])})" if est_seconds[0] else ""
-            log_lines = "\n".join(log_buffer) if log_buffer else "  (waiting for activity...)"
+            log_lines = "\n".join(log_buffer)
+            isk_line    = f"Min ISK:     {isk_label}\n" if isk_label else ""
+            region_line = f"Regions:     {region_label[:42]}\n" if region_label else ""
             return (
                 f"```\n"
                 f"Categories:  {cat_label[:36]}\n"
                 f"Time range:  {time_label}\n"
                 f"Security:    {space_label}\n"
+                f"{isk_line}"
+                f"{region_line}"
                 f"{sep}\n"
                 f"Regions     {stages['regions']}\n"
                 f"zKillboard  {stages['zkill']}\n"
@@ -295,6 +367,13 @@ class KillFilterView(discord.ui.View):
         )
         status_msg = await channel.send(content=build_status())
 
+        def _term_status():
+            """Overwrite the current terminal line with a compact live status."""
+            zkill_s = (stages['zkill']
+                       .replace("[ ]", " ").replace("[~]", "~").replace("[✓]", "✓"))
+            line = f"  [{_elapsed()}]  {zkill_s}"
+            print(f"\r\033[2K{line[:120]}", end="", flush=True)
+
         async def _edit_loop():
             while not _loop_stop[0]:
                 await asyncio.sleep(0.5)
@@ -302,6 +381,7 @@ class KillFilterView(discord.ui.View):
                     await status_msg.edit(content=build_status())
                 except Exception:
                     pass
+                _term_status()
 
         loop_task = asyncio.ensure_future(_edit_loop())
 
@@ -344,21 +424,26 @@ class KillFilterView(discord.ui.View):
                 on_log=on_log,
                 stop_event=_stop_event,
                 skip_event=_skip_event,
+                min_isk=min_isk,
+                max_results=max_results,
+                region_filter=region_filter,
             )
             if _stop_event is not None and _stop_event.is_set():
                 await channel.send(f"⏹ **Scan stopped.** No results posted.")
                 await status_msg.edit(content="⏹ Stopped.")
             elif not kills:
+                _SPACE_NAMES = {"nullsec": "Null Sec", "lowsec": "Low Sec", "wormhole": "Wormhole Space", "highsec": "High Sec"}
+                space_msg = " + ".join(_SPACE_NAMES[s] for s in self.selected_space if s in _SPACE_NAMES)
                 await channel.send(
                     content=(
                         f"{caller.mention} — no kills found for **{cat_label}** "
-                        f"in the last **{time_label}** in **{space_label}**."
+                        f"in the **{time_label.lower()}** in **{space_msg}**."
                     )
                 )
                 await status_msg.edit(content="✅ Done — no results.")
             else:
                 embed = build_summary_embed(kills, self.selected_categories, time_key)
-                # Fix #4: tag the caller when results are ready
+                _last_embed = embed
                 await channel.send(content=f"{caller.mention} — kill report ready!", embed=embed)
 
                 # ── Detailed kill list (pilot | ship | ISK | link) ────────────
@@ -435,10 +520,20 @@ class KillFilterView(discord.ui.View):
         finally:
             _loop_stop[0] = True
             loop_task.cancel()
-            _stop_event  = None
-            _skip_event  = None
-            _fetch_phase = ""
+            print()  # move terminal cursor past the live status line
+            _stop_event     = None
+            _skip_event     = None
+            _fetch_phase    = ""
+            _fetch_start_ts = None
             fetch_in_progress = False
+
+    # ── Region filter button ──────────────────────────────────────────────────
+
+    @discord.ui.button(label="Regions", style=discord.ButtonStyle.secondary, emoji="🗺️")
+    async def region_button(
+        self, _button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        await interaction.response.send_modal(RegionModal(view_ref=self, btn_interaction=interaction))
 
     # ── Cancel button ─────────────────────────────────────────────────────────
 
@@ -465,7 +560,7 @@ async def on_ready():
         channel = bot.get_channel(AUTO_POST_CHANNEL_ID)
         if channel:
             embed = discord.Embed(
-                description="🟢 **zKill Bot is online and ready.**",
+                description="🟢 **zKill Bot is online and ready.**\nType `/help` to see available commands.",
                 color=discord.Color.green(),
             )
             await channel.send(embed=embed)
@@ -478,17 +573,47 @@ async def on_ready():
 )
 async def scan(ctx: discord.ApplicationContext):
     view = KillFilterView()
+    await ctx.respond(content=view._form_content(), view=view, ephemeral=True)
+
+
+@bot.slash_command(
+    guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
+    description="Re-post the summary embed from the most recent completed scan",
+)
+async def last(ctx: discord.ApplicationContext):
+    if _last_embed is None:
+        await ctx.respond("📋 No scan results yet — run `/scan` first.", ephemeral=True)
+        return
     await ctx.respond(
-        content=(
-            "**Kill Report Filters**\n"
-            "Select at least one category, a time range, and a space type, then hit **Fetch**.\n\n"
-            "✅ Categories: *(required — select at least one)*\n"
-            "⏱ Time range: **Last 24 hours**\n"
-            "🌌 Space: **Null Security + Low Security**"
-        ),
-        view=view,
-        ephemeral=True,
+        content=f"📋 **Last scan results** (reposted by {ctx.author.mention}):",
+        embed=_last_embed,
     )
+
+
+@bot.slash_command(
+    guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
+    description="Show the status of the current scan",
+)
+async def status(ctx: discord.ApplicationContext):
+    if not fetch_in_progress:
+        await ctx.respond("💤 No scan is currently running.", ephemeral=True)
+        return
+    _PHASE_LABELS = {
+        "zkill": "Scanning zKillboard",
+        "esi":   "Fetching ESI killmails",
+        "names": "Resolving names",
+        "":      "Starting up",
+    }
+    phase = _PHASE_LABELS.get(_fetch_phase, _fetch_phase)
+    elapsed = ""
+    if _fetch_start_ts is not None:
+        s = int(_time.monotonic() - _fetch_start_ts)
+        m, sec = divmod(s, 60)
+        elapsed = f"{m}m {sec:02d}s" if m else f"{sec}s"
+    embed = discord.Embed(title="🔍 Scan In Progress", color=discord.Color.orange())
+    embed.add_field(name="Phase",   value=phase,   inline=True)
+    embed.add_field(name="Elapsed", value=elapsed, inline=True)
+    await ctx.respond(embed=embed, ephemeral=True)
 
 
 @bot.slash_command(
@@ -532,8 +657,10 @@ async def help(ctx: discord.ApplicationContext):
         description="Scans zKillboard for ship losses in NullSec, LowSec, and Wormhole space.",
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="🔍 /scan",  value="Open the kill report filter form.", inline=False)
-    embed.add_field(name="⏹ /stop",  value="Abort the current scan immediately. No results are posted.", inline=False)
+    embed.add_field(name="🔍 /scan",   value="Open the kill report filter form.", inline=False)
+    embed.add_field(name="📋 /last",   value="Re-post the summary embed from the most recent completed scan.", inline=False)
+    embed.add_field(name="📊 /status", value="Show the current scan phase and elapsed time.", inline=False)
+    embed.add_field(name="⏹ /stop",   value="Abort the current scan immediately. No results are posted.", inline=False)
     embed.add_field(name="⏭ /skip",  value="Skip remaining zKillboard scanning and post partial results. Only usable during the scanning phase.", inline=False)
     embed.add_field(name="🏓 /ping",  value="Check latency.", inline=False)
     embed.add_field(name="📖 /help",  value="Show this message.", inline=False)
