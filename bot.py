@@ -30,30 +30,63 @@ _skip_first_daily = True   # skip the immediate fire on startup; run after first
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: str) -> discord.Embed:
-    total_value    = sum(k.get("total_value", k.get("zkb", {}).get("totalValue", 0)) for k in kills)
-    value_str      = f"{total_value / 1_000_000_000:.2f}B ISK" if total_value else "N/A"
-    category_names = " · ".join(SHIP_CATEGORIES[k]["label"] for k in category_keys) if category_keys else "All ships"
-    time_label     = TIME_RANGES[time_key]["label"] if time_key in TIME_RANGES else time_key
+    total_value = sum(k.get("total_value", 0) for k in kills)
+    if total_value >= 1e12:
+        value_str = f"{total_value/1e12:.2f}T ISK"
+    elif total_value >= 1e9:
+        value_str = f"{total_value/1e9:.2f}B ISK"
+    else:
+        value_str = f"{total_value/1e6:.0f}M ISK"
+
+    cat_names  = " · ".join(SHIP_CATEGORIES[k]["label"] for k in category_keys) if category_keys else "All ships"
+    time_label = TIME_RANGES[time_key]["label"] if time_key in TIME_RANGES else time_key
+
+    unique_pilots = len({k.get("pilot_name") for k in kills
+                         if k.get("pilot_name") not in (None, "Unknown", "Unknown (NPC)")})
+
+    _SPACE = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole"}
+    present     = {k.get("space_type") for k in kills if k.get("space_type")}
+    space_label = " · ".join(v for s, v in _SPACE.items() if s in present) or "⚫ Null Sec · 🔴 Low Sec"
 
     embed = discord.Embed(
-        title=f"💀 Kill Report — {time_label}",
-        description=f"**Categories:** {category_names}",
+        title="Pilots deaths report ready! ✅",
+        description=(
+            f"**📁 {cat_names}**\n"
+            f"⏱ {time_label}  ·  🌌 {space_label}"
+        ),
         color=discord.Color.red(),
     )
-    embed.add_field(name="Total Kills",          value=f"{len(kills):,}",  inline=True)
-    embed.add_field(name="Total ISK Destroyed",  value=value_str,          inline=True)
+    embed.add_field(name="💀 Kills",         value=f"{len(kills):,}",   inline=True)
+    embed.add_field(name="👤 Unique pilots", value=f"{unique_pilots:,}", inline=True)
+    embed.add_field(name="💰 Total ISK",     value=value_str,            inline=True)
 
-    # Show up to 10 kills inline
-    if kills:
-        lines = []
-        for k in kills[:10]:
-            pilot = k.get("pilot_name", "Unknown")
-            value = k.get("total_value", 0)
-            url   = k.get("zkill_url", "")
-            lines.append(f"[{pilot}]({url}) — {value / 1_000_000:.0f}M ISK")
-        if len(kills) > 10:
-            lines.append(f"*...and {len(kills) - 10} more*")
-        embed.add_field(name="Kills", value="\n".join(lines), inline=False)
+    # Breakdown by category
+    if category_keys:
+        cat_lines = []
+        for key in category_keys:
+            cat_kills = [k for k in kills if k.get("category") == key]
+            if cat_kills:
+                isk   = sum(k.get("total_value", 0) for k in cat_kills)
+                isk_s = f"{isk/1e9:.2f}B" if isk >= 1e9 else f"{isk/1e6:.0f}M"
+                cat_lines.append(
+                    f"{SHIP_CATEGORIES[key]['emoji']} {SHIP_CATEGORIES[key]['label']}: "
+                    f"**{len(cat_kills)}** kills · {isk_s} ISK"
+                )
+        if cat_lines:
+            embed.add_field(name="📊 By category", value="\n".join(cat_lines), inline=False)
+
+    # Breakdown by security
+    space_lines = []
+    for s_key in ("nullsec", "lowsec", "wormhole"):
+        s_kills = [k for k in kills if k.get("space_type") == s_key]
+        if s_kills:
+            emoji = {"nullsec": "⚫", "lowsec": "🔴", "wormhole": "🌀"}[s_key]
+            label = {"nullsec": "Null Sec", "lowsec": "Low Sec", "wormhole": "Wormhole"}[s_key]
+            isk   = sum(k.get("total_value", 0) for k in s_kills)
+            isk_s = f"{isk/1e9:.2f}B" if isk >= 1e9 else f"{isk/1e6:.0f}M"
+            space_lines.append(f"{emoji} {label}: **{len(s_kills)}** kills · {isk_s} ISK")
+    if space_lines:
+        embed.add_field(name="🌌 By security", value="\n".join(space_lines), inline=False)
 
     embed.set_footer(text="Data via zKillboard + ESI")
     return embed
@@ -193,11 +226,13 @@ class KillFilterView(discord.ui.View):
 
         # ── Live progress state ───────────────────────────────────────────────
         W = 14  # progress bar width (chars)
+        _SPACE_LABELS = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole"}
+        space_label = " · ".join(_SPACE_LABELS[s] for s in self.selected_space if s in _SPACE_LABELS)
         stages = {
-            "regions": "[ ] discovering...",
-            "zkill":   "[ ] —",
-            "esi":     "[ ] —",
-            "names":   "[ ] —",
+            "regions": "[ ] Classifying NS / LS / WH regions...",
+            "zkill":   "[ ] Waiting for region list...",
+            "esi":     "[ ] Pending kill data",
+            "names":   "[ ] Pending ESI enrichment",
         }
         last_edit   = [0.0]
         start_ts    = [_time.monotonic()]
@@ -221,11 +256,13 @@ class KillFilterView(discord.ui.View):
             return f"~{m}m {sec:02d}s" if m else f"~{sec}s"
 
         def build_status() -> str:
-            sep = "─" * 44
+            sep = "─" * 48
             eta = f"  (est. {_fmt_est(est_seconds[0])})" if est_seconds[0] else ""
             return (
                 f"```\n"
-                f"▶  {cat_label[:38]}  /  {time_label}\n"
+                f"Categories  {cat_label[:36]}\n"
+                f"Time range  {time_label}\n"
+                f"Security    {space_label}\n"
                 f"{sep}\n"
                 f"Regions     {stages['regions']}\n"
                 f"zKillboard  {stages['zkill']}\n"
@@ -245,25 +282,25 @@ class KillFilterView(discord.ui.View):
         async def on_progress(event: dict):
             phase = event.get("phase")
             if phase == "regions":
-                stages["regions"] = f"[✓] {event['count']} regions"
-                stages["zkill"]   = "[~] starting..."
+                stages["regions"] = f"[✓] {event['count']} regions classified"
+                stages["zkill"]   = "[~] Scanning ship kills across all selected regions..."
             elif phase == "zkill_start":
                 total = event["types"]
                 est_seconds[0] = total   # 1 req/s → total seconds
-                stages["zkill"] = f"[~] {_bar(0, total)}  0/{total}"
+                stages["zkill"] = f"[~] {_bar(0, total)}  0/{total}  — querying zKillboard"
             elif phase == "zkill_progress":
                 done, total, found = event["done"], event["total"], event["found"]
                 stages["zkill"] = f"[~] {_bar(done, total)}  {done}/{total}  ({found} hits)"
             elif phase == "zkill_done":
                 found = event["found"]
-                stages["zkill"] = f"[✓] {found} kill{'s' if found != 1 else ''} found"
-                stages["esi"]   = f"[~] {_bar(0, found)}  0/{found}"
+                stages["zkill"] = f"[✓] {found} kill{'s' if found != 1 else ''} matched"
+                stages["esi"]   = f"[~] {_bar(0, found)}  0/{found}  — fetching ESI killmails"
             elif phase == "esi":
                 done, total = event["done"], event["total"]
-                stages["esi"] = f"[~] {_bar(done, total)}  {done}/{total}"
+                stages["esi"] = f"[~] {_bar(done, total)}  {done}/{total}  — enriching kills"
             elif phase == "names":
                 stages["esi"]   = stages["esi"].replace("[~]", "[✓]")
-                stages["names"] = "[~] resolving..."
+                stages["names"] = "[~] Resolving pilot names & ship types..."
 
             # Throttle Discord edits to ~1 per 2 seconds
             now = _time.monotonic()
@@ -286,23 +323,40 @@ class KillFilterView(discord.ui.View):
             # Fix #4: tag the caller when results are ready
             await channel.send(content=f"{caller.mention} — kill report ready!", embed=embed)
 
-            # ── Copyable pilot list for in-game mail ──────────────────────────
+            # ── Detailed kill list (pilot | ship | ISK | link) ────────────────
             if kills:
+                detail_lines = []
+                for k in kills:
+                    pilot = k.get("pilot_name", "")
+                    if not pilot or pilot in ("Unknown", "Unknown (NPC)"):
+                        continue
+                    ship  = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
+                    isk   = k.get("total_value", 0) / 1_000_000
+                    url   = k.get("zkill_url", "")
+                    detail_lines.append(f"{pilot} | {ship} | {isk:.0f}M ISK | {url}")
+
+                if detail_lines:
+                    detail_block = "\n".join(detail_lines)
+                    d_header = f"📋 **Kill details** ({len(detail_lines)} kills):\n"
+                    if len(detail_block) <= 1800:
+                        await channel.send(content=f"{d_header}```\n{detail_block}\n```")
+                    else:
+                        buf = io.BytesIO(detail_block.encode("utf-8"))
+                        await channel.send(content=d_header, file=discord.File(buf, filename="kills.txt"))
+
+                # ── Comma-separated pilot names for in-game mail ──────────────
                 names = [k.get("pilot_name") for k in kills
                          if k.get("pilot_name") not in (None, "Unknown", "Unknown (NPC)")]
                 if names:
                     seen: set[str] = set()
                     unique_names = [n for n in names if not (n in seen or seen.add(n))]
-                    pilot_block = "\n".join(unique_names)
-                    header = f"📋 **Pilot list** ({len(unique_names)} pilots) — copy into EVE in-game mail:\n"
-                    if len(pilot_block) <= 1800:
-                        await channel.send(content=f"{header}```\n{pilot_block}\n```")
+                    comma_list = ", ".join(unique_names)
+                    m_header = f"📮 **In-game mail list** ({len(unique_names)} pilots):\n"
+                    if len(comma_list) <= 1800:
+                        await channel.send(content=f"{m_header}```\n{comma_list}\n```")
                     else:
-                        buf = io.BytesIO(pilot_block.encode("utf-8"))
-                        await channel.send(
-                            content=header,
-                            file=discord.File(buf, filename="pilot_list.txt"),
-                        )
+                        buf = io.BytesIO(comma_list.encode("utf-8"))
+                        await channel.send(content=m_header, file=discord.File(buf, filename="pilot_names.txt"))
 
             await status_msg.edit(content="✅ Done!")
         except Exception as e:
@@ -332,6 +386,13 @@ async def on_ready():
     print("------")
     if AUTO_POST_CHANNEL_ID:
         daily_kill_summary.start()
+        channel = bot.get_channel(AUTO_POST_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                description="🟢 **zKill Bot is online and ready.**",
+                color=discord.Color.green(),
+            )
+            await channel.send(embed=embed)
 
 # ── Slash Commands ────────────────────────────────────────────────────────────
 

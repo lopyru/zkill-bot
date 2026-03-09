@@ -370,6 +370,28 @@ async def resolve_names_bulk(
 
     return name_map
 
+
+async def resolve_type_names(client: httpx.AsyncClient, type_ids: list[int]) -> dict[int, str]:
+    """Resolve EVE item type IDs to display names via /universe/names/."""
+    if not type_ids:
+        return {}
+    name_map: dict[int, str] = {}
+    try:
+        resp = await client.post(
+            f"{ESI_BASE}/universe/names/?datasource=tranquility",
+            json=list(set(type_ids)),
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            for entry in resp.json():
+                if entry.get("category") == "inventory_type":
+                    name_map[entry["id"]] = entry["name"]
+        else:
+            print(f"  ⚠ ESI /universe/names/ HTTP {resp.status_code} for type IDs")
+    except Exception as e:
+        print(f"  Error resolving type names: {e}")
+    return name_map
+
 # ── Step 4: Filter + enrich ───────────────────────────────────────────────────
 
 async def enrich_kills(
@@ -463,6 +485,11 @@ async def fetch_all_kills(
         region_map = await get_regions(client)
         regions = [r for t in ("nullsec", "lowsec", "wormhole") if t in selected_space for r in region_map[t]]
 
+        # Reverse maps for tagging kills with category + space type
+        group_to_cat    = {gid: key for key, cat in SHIP_CATEGORIES.items() for gid in cat.get("group_ids", set())}
+        type_to_cat     = {tid: key for key, cat in SHIP_CATEGORIES.items() for tid in cat.get("type_ids", set())}
+        region_to_space = {rid: t for t in ("nullsec", "lowsec", "wormhole") for rid in region_map[t]}
+
         if not category_keys:
             # ── Unfiltered path: fetch all kills per region ───────────────────
             raw_killmails: list[dict] = []
@@ -509,6 +536,8 @@ async def fetch_all_kills(
                 kid = k.get("killmail_id")
                 if kid and kid not in seen_ids:
                     seen_ids.add(kid)
+                    k["_category"]   = group_to_cat.get(group_id)
+                    k["_space_type"] = region_to_space.get(region_id, "unknown")
                     matched_raw.append(k)
             if new_hits:
                 print(f"  [{done_count}/{total_tasks}] groupID {group_id} / region {region_id} → {new_hits} kill(s)  (total: {len(matched_raw)})")
@@ -530,6 +559,8 @@ async def fetch_all_kills(
                 kid = k.get("killmail_id")
                 if kid and kid not in seen_ids:
                     seen_ids.add(kid)
+                    k["_category"]   = type_to_cat.get(type_id)
+                    k["_space_type"] = region_to_space.get(region_id, "unknown")
                     matched_raw.append(k)
                     new_hits += 1
             if new_hits:
@@ -589,7 +620,10 @@ async def fetch_all_kills(
                 "total_value":     zkb.get("totalValue", 0),
                 "points":          zkb.get("points", 0),
                 "zkill_url":       f"https://zkillboard.com/kill/{killmail_id}/",
-                "pilot_name":      None,  # filled in below
+                "pilot_name":      None,  # filled below
+                "ship_name":       None,  # filled below
+                "category":        k.get("_category"),
+                "space_type":      k.get("_space_type"),
             })
 
             if on_progress and i % 5 == 0:
@@ -608,6 +642,14 @@ async def fetch_all_kills(
             entry["pilot_name"] = name_map.get(char_id, "Unknown (NPC)" if not char_id else "Unknown")
             print(f"  ✓ {entry['pilot_name']} | ship {entry['ship_type_id']} | "
                   f"{entry['total_value'] / 1_000_000:.1f}M ISK")
+
+        # Resolve ship type names
+        ship_type_ids = list({e["ship_type_id"] for e in enriched if e.get("ship_type_id")})
+        if ship_type_ids:
+            print(f"  Resolving {len(ship_type_ids)} ship type name(s)...")
+            type_name_map = await resolve_type_names(client, ship_type_ids)
+            for entry in enriched:
+                entry["ship_name"] = type_name_map.get(entry["ship_type_id"], "Unknown Ship")
 
         print(f"\n  {len(enriched)} kills enriched.")
         return enriched
