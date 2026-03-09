@@ -55,20 +55,21 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
 
     _SPACE  = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole", "highsec": "🟡 High Sec"}
     present = {k.get("space_type") for k in kills if k.get("space_type")}
+    space_str = "  ·  ".join(v for s, v in _SPACE.items() if s in present)
 
     embed = discord.Embed(
-        title="Pilots deaths report ready! ✅",
+        title="Kill Report  ✅",
         description=(
-            f"**📁 {cat_names}**\n"
-            f"⏱ {time_label}\n"
-            f"🌌 **Security**\n"
-            + " ".join(v for s, v in _SPACE.items() if s in present)
+            f"**{cat_names}**\n"
+            f"\n"
+            f"⏱  {time_label}\n"
+            f"🌌  {space_str}"
         ),
         color=discord.Color.red(),
     )
-    embed.add_field(name="💀 Kills",         value=f"{len(kills):,}",   inline=True)
-    embed.add_field(name="👤 Unique pilots", value=f"{unique_pilots:,}", inline=True)
-    embed.add_field(name="💰 Total ISK",     value=value_str,            inline=True)
+    embed.add_field(name="💀 Kills",         value=f"**{len(kills):,}**",   inline=True)
+    embed.add_field(name="👤 Unique pilots", value=f"**{unique_pilots:,}**", inline=True)
+    embed.add_field(name="💰 Total ISK",     value=f"**{value_str}**",       inline=True)
 
     # Breakdown by category
     if category_keys:
@@ -80,9 +81,10 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
                 isk_s = f"{isk/1e9:.2f}B" if isk >= 1e9 else f"{isk/1e6:.0f}M"
                 cat_lines.append(
                     f"{SHIP_CATEGORIES[key]['emoji']} {SHIP_CATEGORIES[key]['label']}: "
-                    f"**{len(cat_kills)}** kills · {isk_s} ISK"
+                    f"**{len(cat_kills)}** kills  ·  {isk_s} ISK"
                 )
         if cat_lines:
+            embed.add_field(name="\u200b", value="\u200b", inline=False)
             embed.add_field(name="📊 By category", value="\n".join(cat_lines), inline=False)
 
     # Breakdown by security
@@ -94,8 +96,9 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
             label = {"nullsec": "Null Sec", "lowsec": "Low Sec", "wormhole": "Wormhole", "highsec": "High Sec"}[s_key]
             isk   = sum(k.get("total_value", 0) for k in s_kills)
             isk_s = f"{isk/1e9:.2f}B" if isk >= 1e9 else f"{isk/1e6:.0f}M"
-            space_lines.append(f"{emoji} {label}: **{len(s_kills)}** kills · {isk_s} ISK")
+            space_lines.append(f"{emoji} {label}: **{len(s_kills)}** kills  ·  {isk_s} ISK")
     if space_lines:
+        embed.add_field(name="\u200b", value="\u200b", inline=False)
         embed.add_field(name="🌌 By security", value="\n".join(space_lines), inline=False)
 
     embed.set_footer(text="Data via zKillboard + ESI")
@@ -447,15 +450,17 @@ class KillFilterView(discord.ui.View):
                 await channel.send(content=f"{caller.mention} — kill report ready!", embed=embed)
 
                 # ── Detailed kill list (pilot | ship | ISK | link) ────────────
+                _SEC_EMOJI = {"nullsec": "⚫", "lowsec": "🔴", "wormhole": "🌀", "highsec": "🟡"}
                 detail_lines = []
                 for k in kills:
                     pilot = k.get("pilot_name", "")
                     if not pilot or pilot in ("Unknown", "Unknown (NPC)"):
                         continue
+                    sec_e = _SEC_EMOJI.get(k.get("space_type", ""), "")
                     ship  = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
                     isk   = k.get("total_value", 0) / 1_000_000
                     url   = k.get("zkill_url", "")
-                    detail_lines.append(f"{pilot} | {ship} | {isk:.0f}M ISK | {url}")
+                    detail_lines.append(f"{sec_e} {pilot} | {ship} | {isk:.0f}M ISK | {url}")
 
                 if detail_lines:
                     # Use <url> format: clickable in Discord messages and suppresses link preview boxes
@@ -464,10 +469,11 @@ class KillFilterView(discord.ui.View):
                         pilot = k.get("pilot_name", "")
                         if not pilot or pilot in ("Unknown", "Unknown (NPC)"):
                             continue
+                        sec_e = _SEC_EMOJI.get(k.get("space_type", ""), "")
                         ship = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
                         isk  = k.get("total_value", 0) / 1_000_000
                         url  = k.get("zkill_url", "")
-                        md_lines.append(f"**{pilot}** — {ship} — {isk:.0f}M ISK — 🔗 <{url}>")
+                        md_lines.append(f"{sec_e} **{pilot}** — {ship} — {isk:.0f}M ISK — 🔗 <{url}>")
 
                     d_header = f"📋 **Kill details** ({len(md_lines)} kills):\n"
                     md_block = "\n".join(md_lines)
