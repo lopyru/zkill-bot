@@ -2,6 +2,7 @@
 bot.py — py-cord Discord bot with interactive filter form.
 """
 
+import io
 import os
 import time as _time
 import discord
@@ -170,18 +171,25 @@ class KillFilterView(discord.ui.View):
     ):
         global fetch_in_progress
 
+        # Fix #2: keep the form visible and send a separate ephemeral notice
         if fetch_in_progress:
-            await interaction.response.edit_message(
-                content="⚠️ A fetch is already running. Please wait.", view=None
+            await interaction.response.send_message(
+                "⚠️ A fetch is already in progress — please wait for it to finish.",
+                ephemeral=True,
             )
             return
 
-        self.disable_all_items()
-        time_label = TIME_RANGES[self.selected_time_key]["label"]
+        fetch_in_progress = True
+        caller     = interaction.user
+        channel    = interaction.channel
+        time_key   = self.selected_time_key
+        time_label = TIME_RANGES[time_key]["label"]
         cat_label  = (
             ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories)
             or "All ships"
         )
+        past_seconds = TIME_RANGES[time_key]["seconds"]
+        categories   = self.selected_categories or None
 
         # ── Live progress state ───────────────────────────────────────────────
         W = 14  # progress bar width (chars)
@@ -193,7 +201,7 @@ class KillFilterView(discord.ui.View):
         }
         last_edit   = [0.0]
         start_ts    = [_time.monotonic()]
-        est_seconds = [0]   # filled in at zkill_start once total requests are known
+        est_seconds = [0]
 
         def _bar(done: int, total: int) -> str:
             if total == 0:
@@ -228,7 +236,11 @@ class KillFilterView(discord.ui.View):
                 f"```"
             )
 
-        await interaction.response.edit_message(content=build_status(), view=self)
+        # Fix #3: dismiss the ephemeral form, open a public progress panel
+        await interaction.response.edit_message(
+            content=f"🔍 Fetching… see progress in <#{channel.id}>", view=None
+        )
+        status_msg = await channel.send(content=build_status())
 
         async def on_progress(event: dict):
             phase = event.get("phase")
@@ -236,7 +248,7 @@ class KillFilterView(discord.ui.View):
                 stages["regions"] = f"[✓] {event['count']} regions"
                 stages["zkill"]   = "[~] starting..."
             elif phase == "zkill_start":
-                total = event["types"]   # already = total requests (groups×regions + types×regions)
+                total = event["types"]
                 est_seconds[0] = total   # 1 req/s → total seconds
                 stages["zkill"] = f"[~] {_bar(0, total)}  0/{total}"
             elif phase == "zkill_progress":
@@ -250,8 +262,7 @@ class KillFilterView(discord.ui.View):
                 done, total = event["done"], event["total"]
                 stages["esi"] = f"[~] {_bar(done, total)}  {done}/{total}"
             elif phase == "names":
-                done_esi = stages["esi"]
-                stages["esi"]   = done_esi.replace("[~]", "[✓]")
+                stages["esi"]   = stages["esi"].replace("[~]", "[✓]")
                 stages["names"] = "[~] resolving..."
 
             # Throttle Discord edits to ~1 per 2 seconds
@@ -260,31 +271,9 @@ class KillFilterView(discord.ui.View):
                 return
             last_edit[0] = now
             try:
-                await interaction.edit_original_response(content=build_status())
+                await status_msg.edit(content=build_status())
             except Exception:
                 pass
-
-        # ── Run fetch ─────────────────────────────────────────────────────────
-        fetch_in_progress = True
-        past_seconds      = TIME_RANGES[self.selected_time_key]["seconds"]
-        categories        = self.selected_categories or None
-        channel           = interaction.channel
-
-        async def safe_send(content=None, embed=None):
-            """Try interaction followup first; fall back to channel if token expired."""
-            try:
-                await interaction.followup.send(content=content, embed=embed)
-                return
-            except Exception:
-                pass
-            if channel:
-                await channel.send(content=content, embed=embed)
-
-        async def safe_edit(content):
-            try:
-                await interaction.edit_original_response(content=content, view=None)
-            except Exception:
-                pass  # token expired — progress panel is already stale, ignore
 
         try:
             kills = await fetch_all_kills(
@@ -293,36 +282,31 @@ class KillFilterView(discord.ui.View):
                 space_types=self.selected_space,
                 on_progress=on_progress,
             )
-            embed = build_summary_embed(kills, self.selected_categories, self.selected_time_key)
-            await safe_send(embed=embed)
+            embed = build_summary_embed(kills, self.selected_categories, time_key)
+            # Fix #4: tag the caller when results are ready
+            await channel.send(content=f"{caller.mention} — kill report ready!", embed=embed)
 
             # ── Copyable pilot list for in-game mail ──────────────────────────
             if kills:
-                names = [k.get("pilot_name", "Unknown") for k in kills if k.get("pilot_name") and k.get("pilot_name") not in ("Unknown", "Unknown (NPC)")]
+                names = [k.get("pilot_name") for k in kills
+                         if k.get("pilot_name") not in (None, "Unknown", "Unknown (NPC)")]
                 if names:
                     seen: set[str] = set()
                     unique_names = [n for n in names if not (n in seen or seen.add(n))]
                     pilot_block = "\n".join(unique_names)
                     header = f"📋 **Pilot list** ({len(unique_names)} pilots) — copy into EVE in-game mail:\n"
-                    chunk_limit = 1900 - len(header)
-                    if len(pilot_block) <= chunk_limit:
-                        await safe_send(content=f"{header}```\n{pilot_block}\n```")
+                    if len(pilot_block) <= 1800:
+                        await channel.send(content=f"{header}```\n{pilot_block}\n```")
                     else:
-                        lines, chunk, chunks = unique_names, [], []
-                        for name in lines:
-                            if sum(len(n) + 1 for n in chunk) + len(name) + 1 > chunk_limit:
-                                chunks.append("\n".join(chunk))
-                                chunk = []
-                            chunk.append(name)
-                        if chunk:
-                            chunks.append("\n".join(chunk))
-                        await safe_send(content=f"{header}```\n{chunks[0]}\n```")
-                        for extra in chunks[1:]:
-                            await safe_send(content=f"```\n{extra}\n```")
+                        buf = io.BytesIO(pilot_block.encode("utf-8"))
+                        await channel.send(
+                            content=header,
+                            file=discord.File(buf, filename="pilot_list.txt"),
+                        )
 
-            await safe_edit("✅ Done!")
+            await status_msg.edit(content="✅ Done!")
         except Exception as e:
-            await safe_edit(f"❌ Fetch failed: `{e}`")
+            await status_msg.edit(content=f"❌ Fetch failed: `{e}`")
         finally:
             fetch_in_progress = False
 

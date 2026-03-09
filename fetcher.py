@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import httpx
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -320,13 +321,21 @@ async def resolve_character_name(client: httpx.AsyncClient, character_id: int) -
 async def resolve_names_bulk(
     client: httpx.AsyncClient, character_ids: list[int]
 ) -> dict[int, str]:
-    """Resolve up to 1 000 character IDs in a single ESI POST call."""
+    """
+    Resolve character IDs to names.
+
+    Tries ESI's bulk /universe/names/ POST first (up to 1 000 per batch).
+    Falls back to individual /characters/{id}/ GET calls for any ID that
+    the bulk endpoint didn't return (handles 404s from invalid/NPC IDs in batch).
+    """
     if not character_ids:
         return {}
 
+    unique_ids = list(dict.fromkeys(cid for cid in character_ids if cid))
     name_map: dict[int, str] = {}
-    for i in range(0, len(character_ids), 1000):
-        batch = character_ids[i : i + 1000]
+
+    for i in range(0, len(unique_ids), 1000):
+        batch = unique_ids[i : i + 1000]
         for _ in range(4):
             try:
                 resp = await client.post(
@@ -343,11 +352,24 @@ async def resolve_names_bulk(
                     for entry in resp.json():
                         if entry.get("category") == "character":
                             name_map[entry["id"]] = entry["name"]
+                else:
+                    print(f"  ⚠ ESI /universe/names/ HTTP {resp.status_code} "
+                          f"for batch of {len(batch)} IDs: {resp.text[:200]}")
                 break
             except Exception as e:
                 print(f"  Error bulk-resolving names: {e}")
                 break
-        if i + 1000 < len(character_ids):
+        if i + 1000 < len(unique_ids):
+            await asyncio.sleep(ESI_DELAY)
+
+    # Fallback: individual lookups for any ID the bulk endpoint missed
+    missing = [cid for cid in unique_ids if cid not in name_map]
+    if missing:
+        print(f"  Falling back to individual lookups for {len(missing)} unresolved IDs...")
+        for cid in missing:
+            name = await resolve_character_name(client, cid)
+            if name not in ("Unknown", "Unknown (NPC)"):
+                name_map[cid] = name
             await asyncio.sleep(ESI_DELAY)
 
     return name_map
@@ -418,9 +440,15 @@ async def fetch_all_kills(
     Args:
         category_keys: list of keys from SHIP_CATEGORIES to include.
                        Pass None or empty list to match ALL ships.
-        past_seconds:  time window in seconds (must be multiple of 3600, max 604800).
+        past_seconds:  time window in seconds. Values < 3600 are supported via
+                       client-side time filtering (zKillboard minimum is 1 hour).
         space_types:   which space to search. Defaults to ["nullsec", "lowsec"].
     """
+    # zKillboard minimum time window is 1 hour; for shorter ranges we query 1h
+    # and discard kills outside the actual window after ESI enrichment.
+    zkill_seconds = max(past_seconds, 3600)
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=past_seconds)
+
     # Build group and type pairs from selected categories
     group_pairs: list[tuple[int, int]] = []
     type_pairs:  list[tuple[int, int]] = []
@@ -478,7 +506,7 @@ async def fetch_all_kills(
 
         # Sequential iteration — avoids background tasks outliving the httpx client
         for group_id, region_id in group_pairs_full:
-            kills = await _fetch_group_region(client, group_id, region_id, past_seconds, semaphore)
+            kills = await _fetch_group_region(client, group_id, region_id, zkill_seconds, semaphore)
             done_count += 1
             new_hits = sum(1 for k in kills if k.get("killmail_id") not in seen_ids)
             for k in kills:
@@ -499,7 +527,7 @@ async def fetch_all_kills(
                 })
 
         for type_id, region_id in type_pairs_full:
-            _, kills = await _fetch_ship_region(client, type_id, region_id, past_seconds, semaphore)
+            _, kills = await _fetch_ship_region(client, type_id, region_id, zkill_seconds, semaphore)
             done_count += 1
             new_hits = 0
             for k in kills:
@@ -539,6 +567,13 @@ async def fetch_all_kills(
             full = await fetch_full_killmail(client, killmail_id, km_hash)
             if not full:
                 continue
+
+            # Client-side time filter — needed when past_seconds < 3600
+            km_time_str = full.get("killmail_time", "")
+            if km_time_str:
+                km_dt = datetime.fromisoformat(km_time_str.replace("Z", "+00:00"))
+                if km_dt < cutoff_dt:
+                    continue
 
             victim       = full.get("victim", {})
             if (victim.get("alliance_id") in EXCLUDED_ALLIANCE_IDS
