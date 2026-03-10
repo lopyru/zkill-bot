@@ -906,6 +906,36 @@ async def fetch_all_kills(
         return enriched
 
 
+# ── Entity search (for /exclusions add) ──────────────────────────────────────
+
+async def search_entity_ids(name: str) -> list[dict]:
+    """
+    Search for a corporation or alliance by exact name via ESI /universe/ids/.
+    Returns a list of dicts: [{"id": int, "name": str, "category": str}, ...]
+    where category is "corporation" or "alliance".
+    """
+    async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
+        try:
+            resp = await client.post(
+                f"{ESI_BASE}/universe/ids/?datasource=tranquility",
+                json=[name],
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            results = []
+            for raw_category in ("corporations", "alliances"):
+                for entry in data.get(raw_category, []):
+                    results.append({
+                        "id":       entry["id"],
+                        "name":     entry["name"],
+                        "category": raw_category.rstrip("s"),  # "corporation" / "alliance"
+                    })
+            return results
+        except Exception:
+            return []
+
+
 # ── Standalone test entry point ───────────────────────────────────────────────
 
 if __name__ == "__main__":

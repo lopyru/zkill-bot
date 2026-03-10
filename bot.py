@@ -13,7 +13,10 @@ import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
 
-from fetcher import fetch_all_kills, SHIP_CATEGORIES, TIME_RANGES
+from fetcher import (
+    fetch_all_kills, SHIP_CATEGORIES, TIME_RANGES,
+    EXCLUDED_ALLIANCE_IDS, EXCLUDED_CORP_IDS, search_entity_ids,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -50,6 +53,31 @@ def _save_daily_config() -> None:
         json.dump(_daily_cfg, f, indent=2)
 
 _daily_cfg: dict = _load_daily_config()
+
+# ── Exclusions persistence ────────────────────────────────────────────────────
+EXCLUSIONS_PATH = "exclusions.json"
+
+def _load_exclusions() -> dict:
+    defaults: dict = {"alliances": {}, "corporations": {}}
+    try:
+        with open(EXCLUSIONS_PATH) as f:
+            defaults.update(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return defaults
+
+def _save_exclusions() -> None:
+    with open(EXCLUSIONS_PATH, "w") as f:
+        json.dump(_exclusions_cfg, f, indent=2)
+
+_exclusions_cfg: dict = _load_exclusions()
+
+# Merge JSON-persisted exclusions into the live fetcher sets
+# (.env values are already in those sets from module initialisation)
+for _aid in list(_exclusions_cfg.get("alliances", {})):
+    EXCLUDED_ALLIANCE_IDS.add(int(_aid))
+for _cid in list(_exclusions_cfg.get("corporations", {})):
+    EXCLUDED_CORP_IDS.add(int(_cid))
 
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -1047,6 +1075,152 @@ async def before_daily():
 async def daily_error(error: Exception):
     print(f"[ERROR] daily_kill_summary crashed: {type(error).__name__}: {error}")
     # Task auto-restarts on the next iteration; log so the issue is visible
+
+# ── /exclusions command group (admin-only) ────────────────────────────────────
+
+class ExclusionConfirmView(discord.ui.View):
+    """Confirm / cancel adding a single entity to the exclusion list."""
+
+    def __init__(self, entity: dict):
+        super().__init__(timeout=60)
+        self.entity = entity
+
+    @discord.ui.button(label="Add", style=discord.ButtonStyle.success)
+    async def add_button(self, _button: discord.ui.Button, interaction: discord.Interaction):
+        eid      = self.entity["id"]
+        ename    = self.entity["name"]
+        category = self.entity["category"]   # "corporation" or "alliance"
+
+        if category == "alliance":
+            _exclusions_cfg.setdefault("alliances", {})[str(eid)] = ename
+            EXCLUDED_ALLIANCE_IDS.add(eid)
+        else:
+            _exclusions_cfg.setdefault("corporations", {})[str(eid)] = ename
+            EXCLUDED_CORP_IDS.add(eid)
+        _save_exclusions()
+
+        self.disable_all_items()
+        await interaction.response.edit_message(
+            content=f"✅ **{ename}** ({category}) added to exclusions.",
+            embed=None,
+            view=self,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, _button: discord.ui.Button, interaction: discord.Interaction):
+        self.disable_all_items()
+        await interaction.response.edit_message(content="Cancelled.", embed=None, view=self)
+
+
+exclusions_grp = bot.create_group(
+    "exclusions",
+    "Manage excluded corporations and alliances",
+    guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
+    default_member_permissions=discord.Permissions(administrator=True),
+)
+
+
+@exclusions_grp.command(description="Add a corp or alliance to the exclusion list by exact name")
+async def add(ctx: discord.ApplicationContext, name: str):
+    await ctx.defer(ephemeral=True)
+    results = await search_entity_ids(name)
+
+    if not results:
+        await ctx.respond("❌ No corporation or alliance found with that exact name.", ephemeral=True)
+        return
+
+    if len(results) > 1:
+        lines = [
+            f"• **{r['name']}** (ID `{r['id']}`) — {r['category']}"
+            for r in results
+        ]
+        await ctx.respond(
+            f"Found **{len(results)} matches** — please be more specific:\n" + "\n".join(lines),
+            ephemeral=True,
+        )
+        return
+
+    entity = results[0]
+    existing_ids = {
+        int(k) for k in list(_exclusions_cfg.get("alliances", {})) + list(_exclusions_cfg.get("corporations", {}))
+    } | EXCLUDED_ALLIANCE_IDS | EXCLUDED_CORP_IDS
+    if entity["id"] in existing_ids:
+        await ctx.respond(
+            f"⚠️ **{entity['name']}** is already in the exclusion list.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="Add exclusion?",
+        description=(
+            f"**{entity['name']}**\n"
+            f"Category: {entity['category']}\n"
+            f"ID: `{entity['id']}`"
+        ),
+        color=discord.Color.orange(),
+    )
+    view = ExclusionConfirmView(entity)
+    await ctx.respond(embed=embed, view=view, ephemeral=True)
+
+
+@exclusions_grp.command(description="Remove a corp or alliance from the exclusion list by name")
+async def remove(ctx: discord.ApplicationContext, name: str):
+    name_lower = name.strip().lower()
+    removed: list[str] = []
+
+    for eid, ename in list(_exclusions_cfg.get("alliances", {}).items()):
+        if ename.lower() == name_lower:
+            del _exclusions_cfg["alliances"][eid]
+            EXCLUDED_ALLIANCE_IDS.discard(int(eid))
+            removed.append(f"**{ename}** (alliance)")
+
+    for eid, ename in list(_exclusions_cfg.get("corporations", {}).items()):
+        if ename.lower() == name_lower:
+            del _exclusions_cfg["corporations"][eid]
+            EXCLUDED_CORP_IDS.discard(int(eid))
+            removed.append(f"**{ename}** (corporation)")
+
+    if not removed:
+        await ctx.respond(
+            f"❌ No exclusion found matching `{name}`.\n"
+            "Note: entries added via `.env` cannot be removed here — edit the env file instead.",
+            ephemeral=True,
+        )
+        return
+
+    _save_exclusions()
+    await ctx.respond(f"✅ Removed: {', '.join(removed)}", ephemeral=True)
+
+
+@exclusions_grp.command(name="list", description="Show all excluded corporations and alliances")
+async def exclusions_list(ctx: discord.ApplicationContext):
+    lines: list[str] = []
+
+    for eid, ename in sorted(_exclusions_cfg.get("alliances", {}).items(), key=lambda x: x[1].lower()):
+        lines.append(f"🔷 **{ename}** — alliance · ID `{eid}`")
+    for eid, ename in sorted(_exclusions_cfg.get("corporations", {}).items(), key=lambda x: x[1].lower()):
+        lines.append(f"🔶 **{ename}** — corp · ID `{eid}`")
+
+    # Show IDs that came from .env and have no name in exclusions.json
+    json_alliance_ids = {int(k) for k in _exclusions_cfg.get("alliances", {})}
+    json_corp_ids     = {int(k) for k in _exclusions_cfg.get("corporations", {})}
+    for eid in sorted(EXCLUDED_ALLIANCE_IDS - json_alliance_ids):
+        lines.append(f"🔷 ID `{eid}` — alliance · *from .env*")
+    for eid in sorted(EXCLUDED_CORP_IDS - json_corp_ids):
+        lines.append(f"🔶 ID `{eid}` — corp · *from .env*")
+
+    if not lines:
+        await ctx.respond("No exclusions configured.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Excluded corps & alliances",
+        description="\n".join(lines),
+        color=discord.Color.red(),
+    )
+    await ctx.respond(embed=embed, ephemeral=True)
+
 
 # ── Graceful shutdown notice ──────────────────────────────────────────────────
 

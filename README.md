@@ -18,6 +18,9 @@ A Discord bot that fetches EVE Online killmail data from [zKillboard](https://zk
 | `/daily channel #ch` *(admin)* | Set the channel where the daily report is posted |
 | `/daily toggle` *(admin)* | Enable or disable the scheduled daily report |
 | `/daily run` *(admin)* | Trigger the daily report immediately with the current configuration |
+| `/exclusions add <name>` *(admin)* | Search ESI for a corp or alliance by exact name and add it to the exclusion list |
+| `/exclusions remove <name>` *(admin)* | Remove a corp or alliance from the exclusion list |
+| `/exclusions list` *(admin)* | Show all currently excluded corps and alliances |
 
 ## Features
 
@@ -27,7 +30,7 @@ A Discord bot that fetches EVE Online killmail data from [zKillboard](https://zk
 - **Detailed kill list** — Per-kill breakdown with pilot, corp, ship, ISK, system, timestamp and zKillboard link; falls back to a `kills.txt` file attachment when the list is too long for a Discord message
 - **Copyable pilot list** — Code-block list of all pilot names ready to paste into an EVE in-game mail; falls back to `pilot_names.txt` file attachment
 - **EVE in-game mail — HTML pilot links** — Pre-formatted HTML with `showinfo` character links for direct paste into the EVE client mail composer; falls back to `eve_mail.txt` file attachment
-- **Friendly-fire exclusion** — Kills where the victim belongs to your own alliance or corporation are silently dropped
+- **Friendly-fire exclusion** — Kills where the victim belongs to your own alliance or corporation are silently dropped; managed via `/exclusions` commands or `.env` constants
 - **Region name filter** — Scan form accepts a comma-separated list of region names to restrict the scan to specific regions regardless of space type
 - **HighSec results cap** — Scans that include High Security space automatically cap zKillboard results at `HIGHSEC_MAX_RESULTS` to prevent runaway scan times
 - **Hard scan timeout** — Each fetch is limited to 1 hour; `/status` warns if a scan appears stuck
@@ -74,14 +77,14 @@ MAX_SCAN_RESULTS     = None                 # Cap zKillboard results (e.g. 500);
 HIGHSEC_MAX_RESULTS  = 200                  # Automatic cap when High Security space is selected
 ```
 
-To exclude kills where the victim is in your own alliance or corporation (so they don't appear in the recruiter's pilot list), add these to `.env`:
+To exclude kills where the victim is in your own alliance or corporation (so they don't appear in the recruiter's pilot list), use the `/exclusions add` command (preferred) or add IDs directly to `.env`:
 
 ```env
 EXCLUDED_ALLIANCE_IDS=99014523
 EXCLUDED_CORP_IDS=98765432,98765433
 ```
 
-Both accept comma-separated IDs. Omit or leave blank to disable the filter.
+Both accept comma-separated IDs. Omit or leave blank to disable. Entries added via `.env` are merged with those managed by `/exclusions` commands, which are persisted to `exclusions.json`.
 
 ### Run
 
@@ -113,6 +116,7 @@ zkill-bot/
 ├── fetcher.py           # Data pipeline: zKillboard → ESI → enriched kill list
 ├── test_local.py        # Local test runner (no Discord required)
 ├── daily_config.json    # Persisted daily report config (auto-created on first /daily configure; gitignored)
+├── exclusions.json      # Persisted exclusion list (auto-created on first /exclusions add; gitignored)
 └── .env                 # DISCORD_TOKEN (not committed)
 ```
 
