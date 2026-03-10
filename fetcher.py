@@ -32,8 +32,9 @@ EXCLUDED_CORP_IDS: set[int] = {
 }
 
 # Module-level cache so region IDs are only discovered once per process
-# Keys: "nullsec", "lowsec", "wormhole"
-_region_cache: dict[str, list[int]] | None = None
+# Keys: "nullsec", "lowsec", "wormhole", "highsec"
+_region_cache: dict[str, list[int]] | None = None   # set after full k-space classification
+_wormhole_ids: list[int] | None = None              # set on first wormhole-only scan or full scan
 
 # Cache ship type_id → group_id so repeated scans don't re-fetch the same types
 _type_group_cache: dict[int, int] = {}
@@ -162,9 +163,22 @@ async def fetch_json(client: httpx.AsyncClient, url: str, delay: float = 0.0, _r
 
 # ── Step 1: Discover regions by security type ────────────────────────────────
 
-async def get_regions(client: httpx.AsyncClient, on_log=None) -> dict[str, list[int]]:
-    """Returns {"nullsec": [...], "lowsec": [...], "wormhole": [...], "highsec": [...]} cached for the process lifetime."""
-    global _region_cache, _region_name_to_id
+async def get_regions(
+    client: httpx.AsyncClient,
+    on_log=None,
+    needed_space: set[str] | None = None,
+) -> dict[str, list[int]]:
+    """Returns {"nullsec": [...], "lowsec": [...], "wormhole": [...], "highsec": [...]} cached for the process lifetime.
+
+    If needed_space contains only "wormhole", k-space classification is skipped entirely —
+    wormhole region IDs are identified by their ID range (>= 11_000_000) in a single ESI call.
+    K-space types (nullsec/lowsec/highsec) always require the full classification pass.
+    """
+    global _region_cache, _wormhole_ids, _region_name_to_id
+
+    kspace_needed = needed_space is None or bool(needed_space & {"nullsec", "lowsec", "highsec"})
+
+    # ── Full cache available ──────────────────────────────────────────────────
     if _region_cache is not None:
         msg = (f"Cached: {len(_region_cache['nullsec'])} NS · {len(_region_cache['lowsec'])} LS · "
                f"{len(_region_cache['wormhole'])} WH · {len(_region_cache['highsec'])} HS regions")
@@ -173,6 +187,28 @@ async def get_regions(client: httpx.AsyncClient, on_log=None) -> dict[str, list[
             await on_log(f"  {msg}")
         return _region_cache
 
+    # ── Wormhole-only fast path (no k-space ESI calls needed) ─────────────────
+    if not kspace_needed:
+        if _wormhole_ids is not None:
+            msg = f"Cached: {len(_wormhole_ids)} WH regions (k-space not classified)"
+            print(msg)
+            if on_log:
+                await on_log(f"  {msg}")
+        else:
+            print("Fetching region list from ESI (wormhole-only — k-space classification skipped)...")
+            if on_log:
+                await on_log("  Fetching region list from ESI (wormhole-only)...")
+            all_regions = await fetch_json(client, f"{ESI_BASE}/universe/regions/?datasource=tranquility")
+            if not all_regions:
+                raise RuntimeError("Could not fetch region list from ESI.")
+            _wormhole_ids = sorted(r for r in all_regions if r >= 11000000)
+            msg = f"  {len(_wormhole_ids)} wormhole regions (k-space classification skipped)"
+            print(msg)
+            if on_log:
+                await on_log(msg)
+        return {"nullsec": [], "lowsec": [], "wormhole": _wormhole_ids, "highsec": []}
+
+    # ── Full k-space classification ───────────────────────────────────────────
     print("Fetching region list from ESI...")
     if on_log:
         await on_log("  Fetching region list from ESI...")
@@ -244,6 +280,7 @@ async def get_regions(client: httpx.AsyncClient, on_log=None) -> dict[str, list[
     if on_log:
         await on_log(summary)
     _region_cache = {"nullsec": nullsec, "lowsec": lowsec, "wormhole": wormhole, "highsec": highsec}
+    _wormhole_ids = wormhole   # also populate fast cache for any later WH-only scan
     return _region_cache
 
 # ── Step 2: Fetch kills per region ───────────────────────────────────────────
@@ -575,7 +612,7 @@ async def fetch_all_kills(
     selected_space = set(space_types) if space_types is not None else {"nullsec", "lowsec"}
 
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
-        region_map = await get_regions(client, on_log=on_log)
+        region_map = await get_regions(client, on_log=on_log, needed_space=selected_space)
 
         if region_filter:
             # Resolve named regions first

@@ -17,8 +17,9 @@ venv/
 .venv/
 env/
 
-# Bot output
+# Bot output / runtime state
 killmails.json
+daily_config.json
 
 # IDE
 .vscode/

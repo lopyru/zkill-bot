@@ -112,7 +112,7 @@ zkill-bot/
 ├── bot.py               # Discord bot, slash commands, UI views, auto-post task
 ├── fetcher.py           # Data pipeline: zKillboard → ESI → enriched kill list
 ├── test_local.py        # Local test runner (no Discord required)
-├── daily_config.json    # Persisted daily report config (auto-created on first /daily configure)
+├── daily_config.json    # Persisted daily report config (auto-created on first /daily configure; gitignored)
 └── .env                 # DISCORD_TOKEN (not committed)
 ```
 

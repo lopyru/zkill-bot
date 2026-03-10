@@ -115,25 +115,26 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
             cat_kills = [k for k in kills if k.get("category") == key]
             if cat_kills:
                 isk   = sum(k.get("total_value", 0) for k in cat_kills)
-                isk_s = f"{isk/1e9:.2f}B ISK" if isk >= 1e9 else f"{isk/1e6:.0f}M ISK"
-                label = SHIP_CATEGORIES[key]["label"]
-                cat_lines.append(f"{label:<22} {len(cat_kills):>5} kills   {isk_s:>12}")
+                isk_s = f"{isk/1e9:.2f}B" if isk >= 1e9 else f"{isk/1e6:.0f}M"
+                cat_lines.append(
+                    f"{SHIP_CATEGORIES[key]['emoji']} {SHIP_CATEGORIES[key]['label']}: "
+                    f"**{len(cat_kills)}** kills  ·  {isk_s} ISK"
+                )
         if cat_lines:
-            embed.add_field(name="📊 By category",
-                            value="```\n" + "\n".join(cat_lines) + "\n```", inline=False)
+            embed.add_field(name="📊 By category", value="\n".join(cat_lines), inline=False)
 
     # Breakdown by security
     space_lines = []
     for s_key in ("nullsec", "lowsec", "wormhole", "highsec"):
         s_kills = [k for k in kills if k.get("space_type") == s_key]
         if s_kills:
+            emoji = {"nullsec": "⚫", "lowsec": "🔴", "wormhole": "🌀", "highsec": "🟡"}[s_key]
             label = {"nullsec": "Null Sec", "lowsec": "Low Sec", "wormhole": "Wormhole", "highsec": "High Sec"}[s_key]
             isk   = sum(k.get("total_value", 0) for k in s_kills)
-            isk_s = f"{isk/1e9:.2f}B ISK" if isk >= 1e9 else f"{isk/1e6:.0f}M ISK"
-            space_lines.append(f"{label:<10} {len(s_kills):>5} kills   {isk_s:>12}")
+            isk_s = f"{isk/1e9:.2f}B" if isk >= 1e9 else f"{isk/1e6:.0f}M"
+            space_lines.append(f"{emoji} {label}: **{len(s_kills)}** kills  ·  {isk_s} ISK")
     if space_lines:
-        embed.add_field(name="🌌 By security",
-                        value="```\n" + "\n".join(space_lines) + "\n```", inline=False)
+        embed.add_field(name="🌌 By security", value="\n".join(space_lines), inline=False)
 
     embed.set_footer(text="Data via zKillboard + ESI")
     return embed
@@ -996,6 +997,8 @@ async def toggle(ctx: discord.ApplicationContext):
     _save_daily_config()
     if _daily_cfg["enabled"]:
         if not daily_kill_summary.is_running():
+            global _skip_first_daily
+            _skip_first_daily = True   # don't fire immediately on re-enable; wait 24h
             daily_kill_summary.start()
         await ctx.respond("🟢 Daily report **enabled**.", ephemeral=True)
     else:
@@ -1039,6 +1042,11 @@ async def daily_kill_summary():
 @daily_kill_summary.before_loop
 async def before_daily():
     await bot.wait_until_ready()
+
+@daily_kill_summary.error
+async def daily_error(error: Exception):
+    print(f"[ERROR] daily_kill_summary crashed: {type(error).__name__}: {error}")
+    # Task auto-restarts on the next iteration; log so the issue is visible
 
 # ── Graceful shutdown notice ──────────────────────────────────────────────────
 
