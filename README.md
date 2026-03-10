@@ -1,15 +1,36 @@
 # zkill-bot
 
-A Discord bot that fetches EVE Online killmail data from [zKillboard](https://zkillboard.com) and [ESI](https://esi.evetech.net), filtered to NullSec and LowSec space.
+A Discord bot that fetches EVE Online killmail data from [zKillboard](https://zkillboard.com) and [ESI](https://esi.evetech.net), with configurable filters for ship categories, time range, security space (Null/Low/Wormhole/High), min ISK, and specific regions.
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `/scan` | Open the interactive filter form (ship categories, time range, space type, min ISK, regions) |
+| `/last [n]` | Re-post the summary embed from a recent scan (1 = latest, up to 5) |
+| `/status` | Show the current scan phase and elapsed time |
+| `/stop` | Abort the current scan immediately — no results posted |
+| `/skip` | Skip remaining zKillboard scanning and post partial results (zkill phase only) |
+| `/ping` | Check bot latency |
+| `/help [public]` | Show available commands (pass `public: True` to post in channel) |
+| `/daily status` *(admin)* | Show current daily report config and next scheduled run time |
+| `/daily configure` *(admin)* | Open a form to set categories, time range, space type, and min ISK |
+| `/daily channel #ch` *(admin)* | Set the channel where the daily report is posted |
+| `/daily toggle` *(admin)* | Enable or disable the scheduled daily report |
+| `/daily run` *(admin)* | Trigger the daily report immediately with the current configuration |
 
 ## Features
 
-- `/kills` — Interactive filter form (ship categories + time range) with a live terminal-style progress display; posts a kill report embed plus a copyable pilot list
-- `/ping` — Health check
+- **Live progress panel** — Public terminal-style status message updated in real time during a scan
 - **Automatic daily summary** — Posts a scheduled kill report to a configured channel every 24 hours
-- Tracks: total kills, total ISK destroyed, up to 10 kills with pilot names and zKillboard links
-- **Copyable pilot list** — After each report, posts a code-block list of all pilot names ready to paste into an EVE in-game mail
-- **Friendly-fire exclusion** — Kills where the victim belongs to your own alliance or corporation are silently dropped, so your recruiter only sees actual recruitment targets
+- **Kill report embed** — Total kills, unique pilots, total ISK destroyed, breakdown by category and security space
+- **Detailed kill list** — Per-kill breakdown with pilot, corp, ship, ISK, system, timestamp and zKillboard link; falls back to a `kills.txt` file attachment when the list is too long for a Discord message
+- **Copyable pilot list** — Code-block list of all pilot names ready to paste into an EVE in-game mail; falls back to `pilot_names.txt` file attachment
+- **EVE in-game mail — HTML pilot links** — Pre-formatted HTML with `showinfo` character links for direct paste into the EVE client mail composer; falls back to `eve_mail.txt` file attachment
+- **Friendly-fire exclusion** — Kills where the victim belongs to your own alliance or corporation are silently dropped
+- **Region name filter** — Scan form accepts a comma-separated list of region names to restrict the scan to specific regions regardless of space type
+- **HighSec results cap** — Scans that include High Security space automatically cap zKillboard results at `HIGHSEC_MAX_RESULTS` to prevent runaway scan times
+- **Hard scan timeout** — Each fetch is limited to 1 hour; `/status` warns if a scan appears stuck
 
 ## Ship Categories
 
@@ -49,6 +70,8 @@ DEV_GUILD_ID         = 123456789012345678   # Your server ID for instant slash c
 AUTO_POST_CHANNEL_ID = 987654321098765432   # Channel for the daily auto-post (0 to disable)
 AUTO_POST_CATEGORIES = ["industrial", "mining"]
 AUTO_POST_TIME_KEY   = "24h"
+MAX_SCAN_RESULTS     = None                 # Cap zKillboard results (e.g. 500); None = no cap
+HIGHSEC_MAX_RESULTS  = 200                  # Automatic cap when High Security space is selected
 ```
 
 To exclude kills where the victim is in your own alliance or corporation (so they don't appear in the recruiter's pilot list), add these to `.env`:
@@ -86,19 +109,20 @@ python fetcher.py
 
 ```
 zkill-bot/
-├── bot.py          # Discord bot, slash commands, UI views, auto-post task
-├── fetcher.py      # Data pipeline: zKillboard → ESI → enriched kill list
-├── test_local.py   # Local test runner (no Discord required)
-└── .env            # DISCORD_TOKEN (not committed)
+├── bot.py               # Discord bot, slash commands, UI views, auto-post task
+├── fetcher.py           # Data pipeline: zKillboard → ESI → enriched kill list
+├── test_local.py        # Local test runner (no Discord required)
+├── daily_config.json    # Persisted daily report config (auto-created on first /daily configure)
+└── .env                 # DISCORD_TOKEN (not committed)
 ```
 
 ## How the fetch pipeline works
 
-1. **Discover regions** — Queries ESI for all k-space regions, samples one system per region to determine security status, and caches the resulting NullSec/LowSec region list for the lifetime of the process.
-2. **Fetch matching kills** — For each selected ship group ID (or individual type ID for ships without a clean group) × NullSec/LowSec region, queries zKillboard's group-filter endpoint (`/api/groupID/{groupID}/regionID/{regionID}/...`) or ship-filter endpoint (`/api/shipID/{typeID}/...`). Requests are serialized (1 per second). Using group IDs reduces the typical industrial+mining query from ~2 100 requests to ~770 (~3× faster).
-3. **Enrich** — Fetches the full ESI killmail for each matched kill to retrieve the victim's character ID, ship type, alliance, and corporation; filters out victims from excluded alliances or corporations; then resolves all remaining pilot names in a single bulk POST to `/universe/names/`.
-4. **Rate limiting** — Strictly 1 req/s to zKillboard (delay applied even on 404 responses); 100 ms between ESI requests; minimum 30 s backoff on HTTP 429; ESI error budget monitored via `X-ESI-Error-Limit-Remain` (pauses 10 s if < 20 remaining).
+1. **Discover regions** — Queries ESI for all regions, samples one system per region to determine security status, and caches the resulting Null/Low/Wormhole/HighSec region lists for the lifetime of the process.
+2. **Fetch matching kills** — For each selected ship group ID (or individual type ID for ships without a clean group) × selected regions, queries zKillboard's group-filter endpoint (`/api/groupID/{groupID}/regionID/{regionID}/...`) or ship-filter endpoint (`/api/shipID/{typeID}/...`). Requests are serialized (1 per second). Using group IDs reduces the typical industrial+mining query from ~2 100 requests to ~770 (~3× faster).
+3. **Enrich** — Fetches the full ESI killmail for each matched kill; validates the victim's ship group against the selected categories (zKillboard filtering is best-effort, so mismatched kills are discarded here); filters out victims from excluded alliances or corporations; applies min-ISK and time-window filters; then resolves all remaining pilot, ship, corp, alliance, and solar system names in bulk via `/universe/names/`.
+4. **Rate limiting** — Strictly 1 req/s to zKillboard (delay applied even on 404 responses); 100 ms between ESI requests; minimum 30 s backoff on HTTP 429 with up to 4 retries; ESI error budget monitored via `X-ESI-Error-Limit-Remain` (pauses 10 s if < 20 remaining).
 
 ## Time ranges
 
-`1h` · `6h` · `12h` · `24h` · `48h` · `7d`
+`15m` · `30m` · `1h` · `6h` · `12h` · `24h` · `48h` · `7d`

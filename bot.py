@@ -5,9 +5,10 @@ bot.py — py-cord Discord bot with interactive filter form.
 import asyncio
 import collections
 import io
+import json
 import os
 import time as _time
-from datetime import datetime, timezone
+from datetime import datetime
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -25,6 +26,31 @@ AUTO_POST_TIME_KEY   = "24h"                       # time range key used by the 
 MAX_SCAN_RESULTS: int | None = None                # cap zKillboard scanning early (e.g. 100); None = no cap
 HIGHSEC_MAX_RESULTS: int = 200                     # automatic cap when High Security space is selected
 
+# ── Daily config persistence ───────────────────────────────────────────────────
+DAILY_CONFIG_PATH = "daily_config.json"
+
+def _load_daily_config() -> dict:
+    defaults: dict = {
+        "enabled":    bool(AUTO_POST_CHANNEL_ID),
+        "channel_id": AUTO_POST_CHANNEL_ID,
+        "categories": list(AUTO_POST_CATEGORIES),
+        "time_key":   AUTO_POST_TIME_KEY,
+        "space_types": ["nullsec", "lowsec"],
+        "min_isk":    None,
+    }
+    try:
+        with open(DAILY_CONFIG_PATH) as f:
+            defaults.update(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return defaults
+
+def _save_daily_config() -> None:
+    with open(DAILY_CONFIG_PATH, "w") as f:
+        json.dump(_daily_cfg, f, indent=2)
+
+_daily_cfg: dict = _load_daily_config()
+
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 bot     = discord.Bot(intents=intents)
@@ -39,7 +65,17 @@ _last_embeds: collections.deque = collections.deque(maxlen=5)  # embeds from the
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: str) -> discord.Embed:
+def _fmt_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {sec:02d}s"
+    if m:
+        return f"{m}m {sec:02d}s"
+    return f"{sec}s"
+
+def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: str, elapsed: float | None = None) -> discord.Embed:
     total_value = sum(k.get("total_value", 0) for k in kills)
     if total_value >= 1e12:
         value_str = f"{total_value/1e12:.2f}T ISK"
@@ -61,10 +97,10 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
     embed = discord.Embed(
         title="Kill Report  ✅",
         description=(
-            f"**{cat_names}**\n"
-            f"\n"
-            f"⏱  {time_label}\n"
-            f"🌌  {space_str}"
+            f"**🚢 Ship categories:**\n{cat_names}\n"
+            f"**⏱ Time Range:**\n{time_label}\n"
+            f"**🌌 Security:**\n{space_str}\n"
+            + (f"**⏳ Scan took:**\n{_fmt_elapsed(elapsed)}" if elapsed is not None else "")
         ),
         color=discord.Color.red(),
     )
@@ -79,31 +115,112 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
             cat_kills = [k for k in kills if k.get("category") == key]
             if cat_kills:
                 isk   = sum(k.get("total_value", 0) for k in cat_kills)
-                isk_s = f"{isk/1e9:.2f}B" if isk >= 1e9 else f"{isk/1e6:.0f}M"
-                cat_lines.append(
-                    f"{SHIP_CATEGORIES[key]['emoji']} {SHIP_CATEGORIES[key]['label']}: "
-                    f"**{len(cat_kills)}** kills  ·  {isk_s} ISK"
-                )
+                isk_s = f"{isk/1e9:.2f}B ISK" if isk >= 1e9 else f"{isk/1e6:.0f}M ISK"
+                label = SHIP_CATEGORIES[key]["label"]
+                cat_lines.append(f"{label:<22} {len(cat_kills):>5} kills   {isk_s:>12}")
         if cat_lines:
-            embed.add_field(name="\u200b", value="\u200b", inline=False)
-            embed.add_field(name="📊 By category", value="\n".join(cat_lines), inline=False)
+            embed.add_field(name="📊 By category",
+                            value="```\n" + "\n".join(cat_lines) + "\n```", inline=False)
 
     # Breakdown by security
     space_lines = []
     for s_key in ("nullsec", "lowsec", "wormhole", "highsec"):
         s_kills = [k for k in kills if k.get("space_type") == s_key]
         if s_kills:
-            emoji = {"nullsec": "⚫", "lowsec": "🔴", "wormhole": "🌀", "highsec": "🟡"}[s_key]
             label = {"nullsec": "Null Sec", "lowsec": "Low Sec", "wormhole": "Wormhole", "highsec": "High Sec"}[s_key]
             isk   = sum(k.get("total_value", 0) for k in s_kills)
-            isk_s = f"{isk/1e9:.2f}B" if isk >= 1e9 else f"{isk/1e6:.0f}M"
-            space_lines.append(f"{emoji} {label}: **{len(s_kills)}** kills  ·  {isk_s} ISK")
+            isk_s = f"{isk/1e9:.2f}B ISK" if isk >= 1e9 else f"{isk/1e6:.0f}M ISK"
+            space_lines.append(f"{label:<10} {len(s_kills):>5} kills   {isk_s:>12}")
     if space_lines:
-        embed.add_field(name="\u200b", value="\u200b", inline=False)
-        embed.add_field(name="🌌 By security", value="\n".join(space_lines), inline=False)
+        embed.add_field(name="🌌 By security",
+                        value="```\n" + "\n".join(space_lines) + "\n```", inline=False)
 
     embed.set_footer(text="Data via zKillboard + ESI")
     return embed
+
+
+async def post_kill_details(channel: discord.TextChannel, kills: list[dict]):
+    """Post the detail list, pilot mail list, and EVE mail body to *channel*."""
+    _SEC_EMOJI = {"nullsec": "⚫", "lowsec": "🔴", "wormhole": "🌀", "highsec": "🟡"}
+
+    def _discord_ts(km_time: str) -> str:
+        try:
+            dt = datetime.fromisoformat(km_time.replace("Z", "+00:00"))
+            return f"<t:{int(dt.timestamp())}:R>"
+        except Exception:
+            return km_time[:16].replace("T", " ") + " UTC"
+
+    def _utc_ts(km_time: str) -> str:
+        try:
+            dt = datetime.fromisoformat(km_time.replace("Z", "+00:00"))
+            return dt.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            return km_time[:16].replace("T", " ") + " UTC"
+
+    def _fmt_isk(value: float) -> str:
+        if value >= 1_000_000_000:
+            return f"{value / 1_000_000_000:.2f}B ISK"
+        return f"{value / 1_000_000:.0f}M ISK"
+
+    detail_lines = []
+    md_lines     = []
+    for k in kills:
+        pilot = k.get("pilot_name", "")
+        if not pilot or pilot in ("Unknown", "Unknown (NPC)"):
+            continue
+        sec_e     = _SEC_EMOJI.get(k.get("space_type", ""), "")
+        ship      = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
+        isk_str   = _fmt_isk(k.get("total_value", 0))
+        url       = k.get("zkill_url", "")
+        corp      = k.get("corp_name", "")
+        system    = k.get("solar_system_name", "?")
+        corp_part = f" ({corp})" if corp else ""
+        detail_lines.append(f"{sec_e} {pilot} | {corp} | {ship} | {isk_str} | {system} | {_utc_ts(k.get('killmail_time', ''))} | {url}")
+        md_lines.append(f"{sec_e} **{pilot}**{corp_part} — {ship} — {isk_str} — 📍 {system} — {_discord_ts(k.get('killmail_time', ''))} — 🔗 <{url}>")
+
+    if md_lines:
+        d_header = f"📋 **Kill details** ({len(md_lines)} kills):\n"
+        md_block = "\n".join(md_lines)
+        if len(d_header) + len(md_block) <= 1900:
+            await channel.send(content=f"{d_header}{md_block}")
+        else:
+            buf = io.BytesIO("\n".join(detail_lines).encode("utf-8"))
+            await channel.send(content=d_header, file=discord.File(buf, filename="kills.txt"))
+
+    # ── Unique pilot list ─────────────────────────────────────────────────────
+    seen_cids: set[int] = set()
+    unique_pilots: list[dict] = []
+    for k in kills:
+        cid   = k.get("character_id")
+        pilot = k.get("pilot_name", "")
+        if not cid or not pilot or pilot in ("Unknown", "Unknown (NPC)"):
+            continue
+        if cid not in seen_cids:
+            seen_cids.add(cid)
+            unique_pilots.append({"name": pilot, "cid": cid})
+
+    if unique_pilots:
+        unique_names = [p["name"] for p in unique_pilots]
+        comma_list   = ", ".join(unique_names)
+        m_header     = f"📮 **In-game mail list** ({len(unique_names)} pilots):\n"
+        if len(comma_list) <= 1800:
+            await channel.send(content=f"{m_header}```\n{comma_list}\n```")
+        else:
+            buf = io.BytesIO(comma_list.encode("utf-8"))
+            await channel.send(content=m_header, file=discord.File(buf, filename="pilot_names.txt"))
+
+        eve_links = "".join(
+            f'<a href="showinfo:1375//{p["cid"]}">{p["name"]}</a><br>'
+            for p in unique_pilots
+        )
+        eve_body = f'<font size="14" color="#ffd98d00">{eve_links}</font>'
+        e_header = f"📨 **EVE in-game mail — HTML pilot links** ({len(unique_pilots)} pilots):\n"
+        if len(eve_body) <= 1800:
+            await channel.send(content=f"{e_header}```\n{eve_body}\n```")
+        else:
+            buf = io.BytesIO(eve_body.encode("utf-8"))
+            await channel.send(content=e_header, file=discord.File(buf, filename="eve_mail.txt"))
+
 
 # ── Region filter modal ───────────────────────────────────────────────────────
 
@@ -357,6 +474,8 @@ class KillFilterView(discord.ui.View):
             m, sec = divmod(s, 60)
             return f"~{m}m {sec:02d}s" if m else f"~{sec}s"
 
+        caller_tag = f"{caller.display_name} ({caller.name})"
+
         def build_status() -> str:
             sep = "─" * 48
             eta = f"  (est. {_fmt_est(est_seconds[0])})" if est_seconds[0] else ""
@@ -364,6 +483,7 @@ class KillFilterView(discord.ui.View):
             isk_line    = f"Min ISK:     {isk_label}\n" if isk_label else ""
             region_line = f"Regions:     {region_label[:42]}\n" if region_label else ""
             return (
+                f"Scan triggered by **{caller_tag}**\n"
                 f"```\n"
                 f"Categories:  {cat_label[:36]}\n"
                 f"Time range:  {time_label}\n"
@@ -437,17 +557,20 @@ class KillFilterView(discord.ui.View):
             log_buffer.append(line)
 
         try:
-            kills = await fetch_all_kills(
-                category_keys=categories,
-                past_seconds=past_seconds,
-                space_types=self.selected_space,
-                on_progress=on_progress,
-                on_log=on_log,
-                stop_event=_stop_event,
-                skip_event=_skip_event,
-                min_isk=min_isk,
-                max_results=max_results,
-                region_filter=region_filter,
+            kills = await asyncio.wait_for(
+                fetch_all_kills(
+                    category_keys=categories,
+                    past_seconds=past_seconds,
+                    space_types=self.selected_space,
+                    on_progress=on_progress,
+                    on_log=on_log,
+                    stop_event=_stop_event,
+                    skip_event=_skip_event,
+                    min_isk=min_isk,
+                    max_results=max_results,
+                    region_filter=region_filter,
+                ),
+                timeout=3600,  # 1-hour hard cap — prevents indefinite hangs
             )
             if _stop_event is not None and _stop_event.is_set():
                 await channel.send(f"⏹ **Scan stopped.** No results posted.")
@@ -463,107 +586,20 @@ class KillFilterView(discord.ui.View):
                 )
                 await status_msg.edit(content="✅ Done — no results.")
             else:
-                embed = build_summary_embed(kills, self.selected_categories, time_key)
+                embed = build_summary_embed(kills, self.selected_categories, time_key,
+                                            elapsed=_time.monotonic() - _fetch_start_ts)
                 _last_embeds.appendleft(embed)
                 await channel.send(content=f"{caller.mention} — kill report ready!", embed=embed)
-
-                # ── Detailed kill list (pilot | ship | ISK | system | time | link) ──
-                _SEC_EMOJI = {"nullsec": "⚫", "lowsec": "🔴", "wormhole": "🌀", "highsec": "🟡"}
-
-                def _discord_ts(km_time: str) -> str:
-                    """Return a Discord relative timestamp tag, e.g. <t:1234567890:R>."""
-                    try:
-                        dt = datetime.fromisoformat(km_time.replace("Z", "+00:00"))
-                        return f"<t:{int(dt.timestamp())}:R>"
-                    except Exception:
-                        return km_time[:16].replace("T", " ") + " UTC"
-
-                def _utc_ts(km_time: str) -> str:
-                    try:
-                        dt = datetime.fromisoformat(km_time.replace("Z", "+00:00"))
-                        return dt.strftime("%Y-%m-%d %H:%M UTC")
-                    except Exception:
-                        return km_time[:16].replace("T", " ") + " UTC"
-
-                detail_lines = []
-                for k in kills:
-                    pilot = k.get("pilot_name", "")
-                    if not pilot or pilot in ("Unknown", "Unknown (NPC)"):
-                        continue
-                    sec_e  = _SEC_EMOJI.get(k.get("space_type", ""), "")
-                    ship   = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
-                    isk    = k.get("total_value", 0) / 1_000_000
-                    url    = k.get("zkill_url", "")
-                    corp   = k.get("corp_name", "")
-                    system = k.get("solar_system_name", "?")
-                    ts     = _utc_ts(k.get("killmail_time", ""))
-                    detail_lines.append(f"{sec_e} {pilot} | {corp} | {ship} | {isk:.0f}M ISK | {system} | {ts} | {url}")
-
-                if detail_lines:
-                    # Use <url> format: clickable in Discord messages and suppresses link preview boxes
-                    md_lines = []
-                    for k in kills:
-                        pilot = k.get("pilot_name", "")
-                        if not pilot or pilot in ("Unknown", "Unknown (NPC)"):
-                            continue
-                        sec_e  = _SEC_EMOJI.get(k.get("space_type", ""), "")
-                        ship   = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
-                        isk    = k.get("total_value", 0) / 1_000_000
-                        url    = k.get("zkill_url", "")
-                        corp   = k.get("corp_name", "")
-                        system = k.get("solar_system_name", "?")
-                        ts     = _discord_ts(k.get("killmail_time", ""))
-                        corp_part = f" ({corp})" if corp else ""
-                        md_lines.append(f"{sec_e} **{pilot}**{corp_part} — {ship} — {isk:.0f}M ISK — 📍 {system} — {ts} — 🔗 <{url}>")
-
-                    d_header = f"📋 **Kill details** ({len(md_lines)} kills):\n"
-                    md_block = "\n".join(md_lines)
-                    if len(d_header) + len(md_block) <= 1900:
-                        await channel.send(content=f"{d_header}{md_block}")
-                    else:
-                        # Too long for one message — send as plain-text file (URLs still copyable)
-                        plain_block = "\n".join(detail_lines)
-                        buf = io.BytesIO(plain_block.encode("utf-8"))
-                        await channel.send(content=d_header, file=discord.File(buf, filename="kills.txt"))
-
-                # ── Comma-separated pilot names for in-game mail ──────────────
-                seen_cids: set[int] = set()
-                unique_pilots: list[dict] = []
-                for k in kills:
-                    cid   = k.get("character_id")
-                    pilot = k.get("pilot_name", "")
-                    if not cid or not pilot or pilot in ("Unknown", "Unknown (NPC)"):
-                        continue
-                    if cid not in seen_cids:
-                        seen_cids.add(cid)
-                        unique_pilots.append({"name": pilot, "cid": cid})
-
-                if unique_pilots:
-                    unique_names = [p["name"] for p in unique_pilots]
-                    comma_list = ", ".join(unique_names)
-                    m_header = f"📮 **In-game mail list** ({len(unique_names)} pilots):\n"
-                    if len(comma_list) <= 1800:
-                        await channel.send(content=f"{m_header}```\n{comma_list}\n```")
-                    else:
-                        buf = io.BytesIO(comma_list.encode("utf-8"))
-                        await channel.send(content=m_header, file=discord.File(buf, filename="pilot_names.txt"))
-
-                    # ── EVE in-game mail body format (showinfo links) ─────────
-                    eve_links = "".join(
-                        f'<a href="showinfo:1375//{p["cid"]}">{p["name"]}</a><br>'
-                        for p in unique_pilots
-                    )
-                    eve_body = f'<font size="14" color="#ffd98d00">{eve_links}</font>'
-                    e_header = f"📨 **EVE mail body** ({len(unique_pilots)} pilots):\n"
-                    if len(eve_body) <= 1800:
-                        await channel.send(content=f"{e_header}```\n{eve_body}\n```")
-                    else:
-                        buf = io.BytesIO(eve_body.encode("utf-8"))
-                        await channel.send(content=e_header, file=discord.File(buf, filename="eve_mail.txt"))
-
                 await status_msg.edit(content="✅ Done!")
+                try:
+                    await post_kill_details(channel, kills)
+                except Exception as e:
+                    await channel.send(f"⚠️ Kill details could not be posted: `{type(e).__name__}: {e}`")
+        except asyncio.TimeoutError:
+            await channel.send(f"{caller.mention} ⏱ **Scan timed out** after 1 hour — no results posted.")
+            await status_msg.edit(content="⏱ Timed out.")
         except Exception as e:
-            await status_msg.edit(content=f"❌ Fetch failed: `{e}`")
+            await status_msg.edit(content=f"❌ Fetch failed: `{type(e).__name__}: {e}`")
         finally:
             _loop_stop[0] = True
             loop_task.cancel()
@@ -596,15 +632,176 @@ class KillFilterView(discord.ui.View):
         self.disable_all_items()
         self.stop()
 
+# ── Daily config UI ───────────────────────────────────────────────────────────
+
+class DailyConfigView(discord.ui.View):
+    """Ephemeral form for /daily configure — mirrors KillFilterView but saves to _daily_cfg."""
+
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.selected_categories: list[str] = list(_daily_cfg["categories"])
+        self.selected_time_key:   str        = _daily_cfg["time_key"]
+        self.selected_space:      list[str]  = list(_daily_cfg["space_types"])
+        self.selected_min_isk:    int | None = _daily_cfg.get("min_isk")
+        # Pre-fill dropdown visuals from current config (selects are in declaration order)
+        selects = [c for c in self.children if isinstance(c, discord.ui.Select)]
+        for opt in selects[0].options:  # categories
+            opt.default = opt.value in self.selected_categories
+        for opt in selects[1].options:  # time range
+            opt.default = opt.value == self.selected_time_key
+        for opt in selects[2].options:  # space
+            opt.default = opt.value in self.selected_space
+        if self.selected_min_isk:
+            for opt in selects[3].options:  # min ISK
+                opt.default = opt.value == str(self.selected_min_isk)
+
+    def _form_content(self) -> str:
+        cat_label  = ", ".join(SHIP_CATEGORIES[k]["label"] for k in self.selected_categories) or "*(none)*"
+        time_label = TIME_RANGES[self.selected_time_key]["label"]
+        _snames    = {"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space", "highsec": "High Security"}
+        space_label = " + ".join(_snames[s] for s in self.selected_space) if self.selected_space else "*(none)*"
+        isk_label   = f"{self.selected_min_isk // 1_000_000:,}M ISK" if self.selected_min_isk else "*(none)*"
+        return (
+            f"📅 **Daily Report Configuration**\n"
+            f"✅ Categories: **{cat_label}**\n"
+            f"⏱ Time range: **{time_label}**\n"
+            f"🌌 Space: **{space_label}**\n"
+            f"💰 Min ISK: **{isk_label}**\n\n"
+            "Hit **Save** to apply, or **Cancel** to discard."
+        )
+
+    @discord.ui.select(
+        placeholder="🚢  Ship categories…",
+        min_values=1, max_values=len(SHIP_CATEGORIES),
+        options=[
+            discord.SelectOption(label=cat["label"], value=key, emoji=cat["emoji"])
+            for key, cat in SHIP_CATEGORIES.items()
+        ],
+    )
+    async def category_select(self, select: discord.ui.Select, interaction: discord.Interaction):
+        self.selected_categories = select.values
+        for opt in select.options:
+            opt.default = opt.value in self.selected_categories
+        await interaction.response.edit_message(content=self._form_content(), view=self)
+
+    @discord.ui.select(
+        placeholder="⏱  Time range…",
+        min_values=1, max_values=1,
+        options=[
+            discord.SelectOption(label=info["label"], value=key)
+            for key, info in TIME_RANGES.items()
+        ],
+    )
+    async def time_select(self, select: discord.ui.Select, interaction: discord.Interaction):
+        self.selected_time_key = select.values[0]
+        for opt in select.options:
+            opt.default = opt.value == self.selected_time_key
+        await interaction.response.edit_message(content=self._form_content(), view=self)
+
+    @discord.ui.select(
+        placeholder="🌌  Space type…",
+        min_values=1, max_values=4,
+        options=[
+            discord.SelectOption(label="Null Security",  value="nullsec",  emoji="⚫"),
+            discord.SelectOption(label="Low Security",   value="lowsec",   emoji="🔴"),
+            discord.SelectOption(label="Wormhole Space", value="wormhole", emoji="🌀"),
+            discord.SelectOption(label="High Security",  value="highsec",  emoji="🟡"),
+        ],
+    )
+    async def space_select(self, select: discord.ui.Select, interaction: discord.Interaction):
+        self.selected_space = select.values
+        for opt in select.options:
+            opt.default = opt.value in self.selected_space
+        await interaction.response.edit_message(content=self._form_content(), view=self)
+
+    @discord.ui.select(
+        placeholder="💰  Min ISK value… (optional)",
+        min_values=0, max_values=1,
+        options=[
+            discord.SelectOption(label="10M ISK minimum",  value="10000000"),
+            discord.SelectOption(label="50M ISK minimum",  value="50000000"),
+            discord.SelectOption(label="100M ISK minimum", value="100000000"),
+            discord.SelectOption(label="250M ISK minimum", value="250000000"),
+            discord.SelectOption(label="500M ISK minimum", value="500000000"),
+            discord.SelectOption(label="1B ISK minimum",   value="1000000000"),
+        ],
+    )
+    async def min_isk_select(self, select: discord.ui.Select, interaction: discord.Interaction):
+        self.selected_min_isk = int(select.values[0]) if select.values else None
+        for opt in select.options:
+            opt.default = bool(select.values) and opt.value == select.values[0]
+        await interaction.response.edit_message(content=self._form_content(), view=self)
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.success, emoji="💾")
+    async def save_button(self, _button: discord.ui.Button, interaction: discord.Interaction):
+        if not self.selected_categories:
+            await interaction.response.edit_message(
+                content="⚠️ Select at least one ship category.\n\n" + self._form_content(), view=self
+            )
+            return
+        if not self.selected_space:
+            await interaction.response.edit_message(
+                content="⚠️ Select at least one space type.\n\n" + self._form_content(), view=self
+            )
+            return
+        _daily_cfg["categories"]  = self.selected_categories
+        _daily_cfg["time_key"]    = self.selected_time_key
+        _daily_cfg["space_types"] = self.selected_space
+        _daily_cfg["min_isk"]     = self.selected_min_isk
+        _save_daily_config()
+        await interaction.response.edit_message(content="✅ Daily report configuration saved.", view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel_button(self, _button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+        self.stop()
+
+    async def on_timeout(self):
+        self.stop()
+
+
+# ── Daily fetch helper ─────────────────────────────────────────────────────────
+
+async def _run_daily_fetch(channel: discord.TextChannel) -> None:
+    """Execute the daily kill fetch and post all results to *channel*."""
+    _daily_start = _time.monotonic()
+    try:
+        kills = await asyncio.wait_for(
+            fetch_all_kills(
+                category_keys=_daily_cfg["categories"],
+                past_seconds=TIME_RANGES[_daily_cfg["time_key"]]["seconds"],
+                space_types=_daily_cfg["space_types"],
+                min_isk=_daily_cfg.get("min_isk"),
+            ),
+            timeout=3600,
+        )
+        if not kills:
+            await channel.send("📅 **Daily Kill Report** — no kills found for the configured filters.")
+            return
+        embed = build_summary_embed(kills, _daily_cfg["categories"], _daily_cfg["time_key"],
+                                    elapsed=_time.monotonic() - _daily_start)
+        embed.title = "📅 Daily Kill Report  ✅"
+        await channel.send(embed=embed)
+        try:
+            await post_kill_details(channel, kills)
+        except Exception as e:
+            await channel.send(f"⚠️ Kill details could not be posted: `{type(e).__name__}: {e}`")
+    except asyncio.TimeoutError:
+        await channel.send("⏱ **Daily scan timed out** after 1 hour — no results posted.")
+    except Exception as e:
+        await channel.send(f"❌ Daily fetch failed: `{type(e).__name__}: {e}`")
+
+
 # ── Events ────────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("------")
-    if AUTO_POST_CHANNEL_ID:
+    if _daily_cfg.get("enabled") and _daily_cfg.get("channel_id"):
         daily_kill_summary.start()
-        channel = bot.get_channel(AUTO_POST_CHANNEL_ID)
+        channel = bot.get_channel(_daily_cfg["channel_id"])
         if channel:
             embed = discord.Embed(
                 description="🟢 **zKill Bot is online and ready.**\nType `/help` to see available commands.",
@@ -627,10 +824,8 @@ async def scan(ctx: discord.ApplicationContext):
     guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
     description="Re-post the summary embed from a recent scan (1 = latest, 2 = second-to-last, …)",
 )
-async def last(
-    ctx: discord.ApplicationContext,
-    n: discord.Option(int, "Which scan to show (1 = latest)", default=1, min_value=1, max_value=5) = 1,
-):
+@discord.option("n", int, description="Which scan to show (1 = latest)", default=1, min_value=1, max_value=5)
+async def last(ctx: discord.ApplicationContext, n: int = 1):
     if not _last_embeds:
         await ctx.respond("📋 No scan results yet — run `/scan` first.", ephemeral=True)
         return
@@ -662,9 +857,17 @@ async def status(ctx: discord.ApplicationContext):
         s = int(_time.monotonic() - _fetch_start_ts)
         m, sec = divmod(s, 60)
         elapsed = f"{m}m {sec:02d}s" if m else f"{sec}s"
-    embed = discord.Embed(title="🔍 Scan In Progress", color=discord.Color.orange())
+    stuck = _fetch_start_ts is not None and (_time.monotonic() - _fetch_start_ts) > 3600
+    color = discord.Color.red() if stuck else discord.Color.orange()
+    embed = discord.Embed(title="🔍 Scan In Progress", color=color)
     embed.add_field(name="Phase",   value=phase,   inline=True)
     embed.add_field(name="Elapsed", value=elapsed, inline=True)
+    if stuck:
+        embed.add_field(
+            name="⚠️ Warning",
+            value="This scan has been running for over 1 hour and may be stuck. Use `/stop` to abort.",
+            inline=False,
+        )
     await ctx.respond(embed=embed, ephemeral=True)
 
 
@@ -703,7 +906,8 @@ async def skip(ctx: discord.ApplicationContext):
     guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
     description="Show available commands",
 )
-async def help(ctx: discord.ApplicationContext):
+@discord.option("public", bool, description="Post this message publicly in the channel", default=False)
+async def help(ctx: discord.ApplicationContext, public: bool = False):
     embed = discord.Embed(
         title="📖 zKill Bot — Commands",
         description="Scans zKillboard for ship losses in NullSec, LowSec, and Wormhole space.",
@@ -716,8 +920,16 @@ async def help(ctx: discord.ApplicationContext):
     embed.add_field(name="⏭ /skip",  value="Skip remaining zKillboard scanning and post partial results. Only usable during the scanning phase.", inline=False)
     embed.add_field(name="🏓 /ping",  value="Check latency.", inline=False)
     embed.add_field(name="📖 /help",  value="Show this message.", inline=False)
+    embed.add_field(
+        name="📅 /daily  *(admin)*",
+        value=(
+            "`status` · `configure` · `channel` · `toggle` · `run`\n"
+            "Manage the automatic daily kill report."
+        ),
+        inline=False,
+    )
     embed.set_footer(text="Data via zKillboard + ESI")
-    await ctx.respond(embed=embed, ephemeral=True)
+    await ctx.respond(embed=embed, ephemeral=not public)
 
 
 @bot.slash_command(
@@ -727,6 +939,85 @@ async def help(ctx: discord.ApplicationContext):
 async def ping(ctx: discord.ApplicationContext):
     await ctx.respond(f"🏓 Pong! Latency: `{round(bot.latency * 1000)}ms`")
 
+# ── /daily command group (admin-only) ────────────────────────────────────────
+
+daily_group = bot.create_group(
+    "daily",
+    "Manage the automatic daily kill report",
+    guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
+    default_member_permissions=discord.Permissions(administrator=True),
+)
+
+
+@daily_group.command(description="Show the current daily report configuration and next scheduled run")
+async def status(ctx: discord.ApplicationContext):
+    cfg = _daily_cfg
+    _snames = {"nullsec": "⚫ Null Sec", "lowsec": "🔴 Low Sec", "wormhole": "🌀 Wormhole", "highsec": "🟡 High Sec"}
+    cat_label   = ", ".join(SHIP_CATEGORIES[k]["label"] for k in cfg["categories"]) or "*(none)*"
+    time_label  = TIME_RANGES[cfg["time_key"]]["label"] if cfg["time_key"] in TIME_RANGES else cfg["time_key"]
+    space_label = " · ".join(_snames[s] for s in cfg["space_types"] if s in _snames) or "*(none)*"
+    isk_label   = f"{cfg['min_isk'] // 1_000_000:,}M ISK" if cfg.get("min_isk") else "*(none)*"
+    channel_str = f"<#{cfg['channel_id']}>" if cfg.get("channel_id") else "*(not set)*"
+    state       = "🟢 Enabled" if cfg.get("enabled") else "🔴 Disabled"
+    next_run    = ""
+    if daily_kill_summary.is_running() and daily_kill_summary.next_iteration:
+        ts = int(daily_kill_summary.next_iteration.timestamp())
+        next_run = f"<t:{ts}:R>"
+    embed = discord.Embed(title="📅 Daily Report — Configuration", color=discord.Color.blurple())
+    embed.add_field(name="Status",     value=state,      inline=True)
+    embed.add_field(name="Channel",    value=channel_str, inline=True)
+    embed.add_field(name="Next run",   value=next_run or "*(task not running)*", inline=True)
+    embed.add_field(name="Categories", value=cat_label,   inline=False)
+    embed.add_field(name="Time range", value=time_label,  inline=True)
+    embed.add_field(name="Security",   value=space_label, inline=True)
+    embed.add_field(name="Min ISK",    value=isk_label,   inline=True)
+    await ctx.respond(embed=embed, ephemeral=True)
+
+
+@daily_group.command(description="Configure the daily report filters (categories, time range, space, min ISK)")
+async def configure(ctx: discord.ApplicationContext):
+    view = DailyConfigView()
+    await ctx.respond(content=view._form_content(), view=view, ephemeral=True)
+
+
+@daily_group.command(description="Set the channel where the daily report is posted")
+@discord.option("target", discord.TextChannel, description="Channel to post the daily report in")
+async def channel(ctx: discord.ApplicationContext, target: discord.TextChannel):
+    _daily_cfg["channel_id"] = target.id
+    _save_daily_config()
+    await ctx.respond(f"✅ Daily report channel set to {target.mention}.", ephemeral=True)
+
+
+@daily_group.command(description="Enable or disable the automatic daily report")
+async def toggle(ctx: discord.ApplicationContext):
+    _daily_cfg["enabled"] = not _daily_cfg.get("enabled", False)
+    _save_daily_config()
+    if _daily_cfg["enabled"]:
+        if not daily_kill_summary.is_running():
+            daily_kill_summary.start()
+        await ctx.respond("🟢 Daily report **enabled**.", ephemeral=True)
+    else:
+        if daily_kill_summary.is_running():
+            daily_kill_summary.stop()
+        await ctx.respond("🔴 Daily report **disabled**.", ephemeral=True)
+
+
+@daily_group.command(description="Run the daily report immediately with the current configuration")
+async def run(ctx: discord.ApplicationContext):
+    if fetch_in_progress:
+        await ctx.respond("⚠️ A scan is already in progress — wait for it to finish.", ephemeral=True)
+        return
+    if not _daily_cfg.get("channel_id"):
+        await ctx.respond("⚠️ No channel configured. Use `/daily channel` first.", ephemeral=True)
+        return
+    target = bot.get_channel(_daily_cfg["channel_id"])
+    if not target:
+        await ctx.respond(f"⚠️ Configured channel `{_daily_cfg['channel_id']}` not found.", ephemeral=True)
+        return
+    await ctx.respond(f"▶️ Running daily report now — posting to {target.mention}.", ephemeral=True)
+    await _run_daily_fetch(target)
+
+
 # ── Automatic daily summary (optional) ───────────────────────────────────────
 
 @tasks.loop(hours=24)
@@ -735,20 +1026,13 @@ async def daily_kill_summary():
     if _skip_first_daily:
         _skip_first_daily = False
         return
-    channel = bot.get_channel(AUTO_POST_CHANNEL_ID)
-    if not channel:
-        print(f"[WARNING] Auto-post channel {AUTO_POST_CHANNEL_ID} not found.")
+    if not _daily_cfg.get("enabled"):
         return
-    try:
-        past_seconds = TIME_RANGES[AUTO_POST_TIME_KEY]["seconds"]
-        kills        = await fetch_all_kills(
-            category_keys=AUTO_POST_CATEGORIES,
-            past_seconds=past_seconds,
-        )
-        embed = build_summary_embed(kills, AUTO_POST_CATEGORIES, AUTO_POST_TIME_KEY)
-        await channel.send(embed=embed)
-    except Exception as e:
-        await channel.send(f"❌ Scheduled fetch failed: `{e}`")
+    channel = bot.get_channel(_daily_cfg["channel_id"])
+    if not channel:
+        print(f"[WARNING] Daily post channel {_daily_cfg['channel_id']} not found.")
+        return
+    await _run_daily_fetch(channel)
 
 @daily_kill_summary.before_loop
 async def before_daily():
@@ -759,8 +1043,8 @@ async def before_daily():
 _original_close = bot.close
 
 async def _close_with_notice():
-    if AUTO_POST_CHANNEL_ID:
-        channel = bot.get_channel(AUTO_POST_CHANNEL_ID)
+    if _daily_cfg.get("channel_id"):
+        channel = bot.get_channel(_daily_cfg["channel_id"])
         if channel:
             embed = discord.Embed(
                 description="🔴 **zKill Bot is going offline.**",

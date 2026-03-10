@@ -420,23 +420,45 @@ async def resolve_type_names(client: httpx.AsyncClient, type_ids: list[int]) -> 
     return name_map
 
 async def resolve_misc_names(client: httpx.AsyncClient, entity_ids: list[int]) -> dict[int, str]:
-    """Resolve solar system, corporation, and alliance IDs to names via /universe/names/."""
+    """Resolve solar system, corporation, and alliance IDs to names via /universe/names/.
+
+    Tries a single bulk POST first. If it fails (e.g. an NPC corp ID triggers a 404),
+    falls back to individual lookups so one bad ID can't blank all the others.
+    """
     if not entity_ids:
         return {}
+    unique_ids = list({eid for eid in entity_ids if eid})
     name_map: dict[int, str] = {}
     try:
         resp = await client.post(
             f"{ESI_BASE}/universe/names/?datasource=tranquility",
-            json=list({eid for eid in entity_ids if eid}),
+            json=unique_ids,
             timeout=30,
         )
         if resp.status_code == 200:
             for entry in resp.json():
                 name_map[entry["id"]] = entry["name"]
-        else:
-            print(f"  ⚠ ESI /universe/names/ HTTP {resp.status_code} for misc entity IDs")
+            return name_map
+        print(f"  ⚠ ESI /universe/names/ HTTP {resp.status_code} for misc entity IDs — retrying individually")
     except Exception as e:
-        print(f"  Error resolving entity names: {e}")
+        print(f"  Error resolving entity names (batch): {e}")
+
+    # Fallback: one request per ID so a single bad ID doesn't kill the rest
+    for eid in unique_ids:
+        if eid in name_map:
+            continue
+        try:
+            resp = await client.post(
+                f"{ESI_BASE}/universe/names/?datasource=tranquility",
+                json=[eid],
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                for entry in resp.json():
+                    name_map[entry["id"]] = entry["name"]
+        except Exception:
+            pass
+        await asyncio.sleep(ESI_DELAY)
     return name_map
 
 
