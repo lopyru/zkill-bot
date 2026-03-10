@@ -180,9 +180,11 @@ async def post_kill_details(channel: discord.TextChannel, kills: list[dict]):
 
     if md_lines:
         d_header = f"📋 **Kill details** ({len(md_lines)} kills):\n"
+        sep      = "─" * 44
         md_block = "\n".join(md_lines)
-        if len(d_header) + len(md_block) <= 1900:
-            await channel.send(content=f"{d_header}{md_block}")
+        full_msg = f"{d_header}{sep}\n{md_block}\n{sep}"
+        if len(full_msg) <= 1900:
+            await channel.send(content=full_msg)
         else:
             buf = io.BytesIO("\n".join(detail_lines).encode("utf-8"))
             await channel.send(content=d_header, file=discord.File(buf, filename="kills.txt"))
