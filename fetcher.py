@@ -520,23 +520,50 @@ async def fetch_all_kills(
             for tid in cat.get("type_ids", set()):
                 type_pairs.append((tid, 0))
 
-    selected_space = set(space_types) if space_types else {"nullsec", "lowsec"}
+    # None  → default (nullsec + lowsec); [] → no security filter (only valid with region_filter)
+    selected_space = set(space_types) if space_types is not None else {"nullsec", "lowsec"}
 
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
         region_map = await get_regions(client, on_log=on_log)
-        regions = [r for t in ("nullsec", "lowsec", "wormhole", "highsec") if t in selected_space for r in region_map.get(t, [])]
 
-        # Apply optional region name filter
         if region_filter:
+            # Resolve named regions first
             filter_ids = {_region_name_to_id[n.lower()] for n in region_filter if n.lower() in _region_name_to_id}
             unknown    = [n for n in region_filter if n.lower() not in _region_name_to_id]
             if unknown:
-                print(f"  ⚠ Unknown region name(s) ignored: {', '.join(unknown)}")
-            if filter_ids:
-                regions = [r for r in regions if r in filter_ids]
-                print(f"  Region filter active: {len(regions)} region(s) selected ({', '.join(region_filter)})")
+                msg = f"  ⚠ Unknown region(s) ignored: {', '.join(unknown)}"
+                print(msg)
+                if on_log: await on_log(msg)
+
+            if selected_space:
+                # Intersection: only keep named regions that match the selected space types
+                space_region_ids = {r for t in selected_space for r in region_map.get(t, [])}
+                excluded = [n for n in region_filter
+                            if n.lower() in _region_name_to_id
+                            and _region_name_to_id[n.lower()] not in space_region_ids]
+                if excluded:
+                    msg = f"  ⚠ Excluded (space type mismatch): {', '.join(excluded)}"
+                    print(msg)
+                    if on_log: await on_log(msg)
+                regions = [rid for rid in filter_ids if rid in space_region_ids]
             else:
-                print(f"  ⚠ Region filter matched nothing — scanning all selected space")
+                # No space filter — scan all named regions regardless of security
+                regions = list(filter_ids)
+                msg = f"  No security filter — scanning all {len(regions)} named region(s)"
+                print(msg)
+                if on_log: await on_log(msg)
+
+            if not regions:
+                msg = "  ⚠ Region filter matched nothing after applying space type filter — 0 regions to scan"
+                print(msg)
+                if on_log: await on_log(msg)
+            else:
+                msg = f"  Region filter: {len(regions)} region(s) → {', '.join(region_filter)}"
+                print(msg)
+                if on_log: await on_log(msg)
+        else:
+            regions = [r for t in ("nullsec", "lowsec", "wormhole", "highsec")
+                       if t in selected_space for r in region_map.get(t, [])]
 
         # Reverse maps for tagging kills with category + space type
         group_to_cat    = {gid: key for key, cat in SHIP_CATEGORIES.items() for gid in cat.get("group_ids", set())}

@@ -153,10 +153,13 @@ class KillFilterView(discord.ui.View):
             or "*(required — select at least one)*"
         )
         time_label   = TIME_RANGES[self.selected_time_key]["label"]
-        space_label  = " + ".join(
-            {"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space", "highsec": "High Security"}[s]
-            for s in self.selected_space
-        )
+        _space_names = {"nullsec": "Null Security", "lowsec": "Low Security", "wormhole": "Wormhole Space", "highsec": "High Security"}
+        if self.selected_space:
+            space_label = " + ".join(_space_names[s] for s in self.selected_space)
+        elif self.selected_regions:
+            space_label = "*(all — no security filter)*"
+        else:
+            space_label = "*(required — select at least one)*"
         isk_label    = f"{self.selected_min_isk // 1_000_000:,}M ISK" if self.selected_min_isk else "*(none)*"
         region_label = ", ".join(self.selected_regions) if self.selected_regions else "*(all regions in selected space)*"
         hs_warning   = (
@@ -227,7 +230,7 @@ class KillFilterView(discord.ui.View):
 
     @discord.ui.select(
         placeholder="🌌  Space type…",
-        min_values=1,
+        min_values=0,
         max_values=4,
         options=[
             discord.SelectOption(label="Null Security",  value="nullsec",  emoji="⚫", default=True),
@@ -275,6 +278,20 @@ class KillFilterView(discord.ui.View):
         self, _button: discord.ui.Button, interaction: discord.Interaction
     ):
         global fetch_in_progress, _stop_event, _skip_event, _fetch_phase, _fetch_start_ts, _last_embed
+
+        if not self.selected_categories:
+            await interaction.response.edit_message(
+                content="⚠️ Please select at least one ship category.\n\n" + self._form_content(),
+                view=self,
+            )
+            return
+
+        if not self.selected_space and not self.selected_regions:
+            await interaction.response.edit_message(
+                content="⚠️ Please select at least one space type, or enter specific regions.\n\n" + self._form_content(),
+                view=self,
+            )
+            return
 
         if fetch_in_progress:
             await interaction.response.edit_message(
