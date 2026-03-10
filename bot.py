@@ -7,6 +7,7 @@ import collections
 import io
 import os
 import time as _time
+from datetime import datetime, timezone
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -34,7 +35,7 @@ _stop_event:    asyncio.Event | None = None   # set by /stop  — aborts scan, n
 _skip_event:    asyncio.Event | None = None   # set by /skip  — skips remaining scan, posts partial results
 _fetch_phase:   str = ""                      # "zkill" | "esi" | "names" | ""
 _fetch_start_ts: float | None = None          # monotonic timestamp when current fetch started
-_last_embed: discord.Embed | None = None      # embed from the most recent completed scan
+_last_embeds: collections.deque = collections.deque(maxlen=5)  # embeds from the last 5 completed scans
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -277,7 +278,7 @@ class KillFilterView(discord.ui.View):
     async def fetch_button(
         self, _button: discord.ui.Button, interaction: discord.Interaction
     ):
-        global fetch_in_progress, _stop_event, _skip_event, _fetch_phase, _fetch_start_ts, _last_embed
+        global fetch_in_progress, _stop_event, _skip_event, _fetch_phase, _fetch_start_ts, _last_embeds
 
         if not self.selected_categories:
             await interaction.response.edit_message(
@@ -463,21 +464,40 @@ class KillFilterView(discord.ui.View):
                 await status_msg.edit(content="✅ Done — no results.")
             else:
                 embed = build_summary_embed(kills, self.selected_categories, time_key)
-                _last_embed = embed
+                _last_embeds.appendleft(embed)
                 await channel.send(content=f"{caller.mention} — kill report ready!", embed=embed)
 
-                # ── Detailed kill list (pilot | ship | ISK | link) ────────────
+                # ── Detailed kill list (pilot | ship | ISK | system | time | link) ──
                 _SEC_EMOJI = {"nullsec": "⚫", "lowsec": "🔴", "wormhole": "🌀", "highsec": "🟡"}
+
+                def _discord_ts(km_time: str) -> str:
+                    """Return a Discord relative timestamp tag, e.g. <t:1234567890:R>."""
+                    try:
+                        dt = datetime.fromisoformat(km_time.replace("Z", "+00:00"))
+                        return f"<t:{int(dt.timestamp())}:R>"
+                    except Exception:
+                        return km_time[:16].replace("T", " ") + " UTC"
+
+                def _utc_ts(km_time: str) -> str:
+                    try:
+                        dt = datetime.fromisoformat(km_time.replace("Z", "+00:00"))
+                        return dt.strftime("%Y-%m-%d %H:%M UTC")
+                    except Exception:
+                        return km_time[:16].replace("T", " ") + " UTC"
+
                 detail_lines = []
                 for k in kills:
                     pilot = k.get("pilot_name", "")
                     if not pilot or pilot in ("Unknown", "Unknown (NPC)"):
                         continue
-                    sec_e = _SEC_EMOJI.get(k.get("space_type", ""), "")
-                    ship  = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
-                    isk   = k.get("total_value", 0) / 1_000_000
-                    url   = k.get("zkill_url", "")
-                    detail_lines.append(f"{sec_e} {pilot} | {ship} | {isk:.0f}M ISK | {url}")
+                    sec_e  = _SEC_EMOJI.get(k.get("space_type", ""), "")
+                    ship   = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
+                    isk    = k.get("total_value", 0) / 1_000_000
+                    url    = k.get("zkill_url", "")
+                    corp   = k.get("corp_name", "")
+                    system = k.get("solar_system_name", "?")
+                    ts     = _utc_ts(k.get("killmail_time", ""))
+                    detail_lines.append(f"{sec_e} {pilot} | {corp} | {ship} | {isk:.0f}M ISK | {system} | {ts} | {url}")
 
                 if detail_lines:
                     # Use <url> format: clickable in Discord messages and suppresses link preview boxes
@@ -486,11 +506,15 @@ class KillFilterView(discord.ui.View):
                         pilot = k.get("pilot_name", "")
                         if not pilot or pilot in ("Unknown", "Unknown (NPC)"):
                             continue
-                        sec_e = _SEC_EMOJI.get(k.get("space_type", ""), "")
-                        ship = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
-                        isk  = k.get("total_value", 0) / 1_000_000
-                        url  = k.get("zkill_url", "")
-                        md_lines.append(f"{sec_e} **{pilot}** — {ship} — {isk:.0f}M ISK — 🔗 <{url}>")
+                        sec_e  = _SEC_EMOJI.get(k.get("space_type", ""), "")
+                        ship   = k.get("ship_name") or f"Ship {k.get('ship_type_id', '?')}"
+                        isk    = k.get("total_value", 0) / 1_000_000
+                        url    = k.get("zkill_url", "")
+                        corp   = k.get("corp_name", "")
+                        system = k.get("solar_system_name", "?")
+                        ts     = _discord_ts(k.get("killmail_time", ""))
+                        corp_part = f" ({corp})" if corp else ""
+                        md_lines.append(f"{sec_e} **{pilot}**{corp_part} — {ship} — {isk:.0f}M ISK — 📍 {system} — {ts} — 🔗 <{url}>")
 
                     d_header = f"📋 **Kill details** ({len(md_lines)} kills):\n"
                     md_block = "\n".join(md_lines)
@@ -601,15 +625,20 @@ async def scan(ctx: discord.ApplicationContext):
 
 @bot.slash_command(
     guild_ids=[DEV_GUILD_ID] if DEV_GUILD_ID else None,
-    description="Re-post the summary embed from the most recent completed scan",
+    description="Re-post the summary embed from a recent scan (1 = latest, 2 = second-to-last, …)",
 )
-async def last(ctx: discord.ApplicationContext):
-    if _last_embed is None:
+async def last(
+    ctx: discord.ApplicationContext,
+    n: discord.Option(int, "Which scan to show (1 = latest)", default=1, min_value=1, max_value=5) = 1,
+):
+    if not _last_embeds:
         await ctx.respond("📋 No scan results yet — run `/scan` first.", ephemeral=True)
         return
+    idx = min(n, len(_last_embeds)) - 1
+    ordinal = {1: "Latest", 2: "2nd last", 3: "3rd last"}.get(idx + 1, f"#{idx + 1}")
     await ctx.respond(
-        content=f"📋 **Last scan results** (reposted by {ctx.author.mention}):",
-        embed=_last_embed,
+        content=f"📋 **{ordinal} scan results** (reposted by {ctx.author.mention}):",
+        embed=_last_embeds[idx],
     )
 
 

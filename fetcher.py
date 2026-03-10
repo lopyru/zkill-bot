@@ -182,7 +182,10 @@ async def get_regions(client: httpx.AsyncClient, on_log=None) -> dict[str, list[
 
     wormhole = sorted(r for r in all_regions if r >= 11000000)
     kspace   = [r for r in all_regions if r < 11000000]
-    print(f"  {len(kspace)} k-space regions to classify, {len(wormhole)} wormhole regions (by ID range).")
+    msg = f"  {len(kspace)} k-space · {len(wormhole)} wormhole regions to classify"
+    print(msg)
+    if on_log:
+        await on_log(msg)
 
     nullsec: list[int] = []
     lowsec:  list[int] = []
@@ -223,13 +226,18 @@ async def get_regions(client: httpx.AsyncClient, on_log=None) -> dict[str, list[
 
         sec = sys_data.get("security_status", 1.0)
         if sec < 0.0:
+            msg = f"  ⚫ NS  {region_name or region_id}"
             print(f"  + [NullSec] {region_name or region_id} (sec={sec:.2f})")
             nullsec.append(region_id)
         elif sec < 0.45:
+            msg = f"  🔴 LS  {region_name or region_id}"
             print(f"  + [LowSec ] {region_name or region_id} (sec={sec:.2f})")
             lowsec.append(region_id)
         else:
-            highsec.append(region_id)   # ~27 regions; skip verbose print
+            msg = f"  🟡 HS  {region_name or region_id}"
+            highsec.append(region_id)
+        if on_log:
+            await on_log(msg)
 
     summary = f"  {len(nullsec)} NS · {len(lowsec)} LS · {len(wormhole)} WH · {len(highsec)} HS regions classified"
     print(f"\n{summary}")
@@ -410,6 +418,27 @@ async def resolve_type_names(client: httpx.AsyncClient, type_ids: list[int]) -> 
     except Exception as e:
         print(f"  Error resolving type names: {e}")
     return name_map
+
+async def resolve_misc_names(client: httpx.AsyncClient, entity_ids: list[int]) -> dict[int, str]:
+    """Resolve solar system, corporation, and alliance IDs to names via /universe/names/."""
+    if not entity_ids:
+        return {}
+    name_map: dict[int, str] = {}
+    try:
+        resp = await client.post(
+            f"{ESI_BASE}/universe/names/?datasource=tranquility",
+            json=list({eid for eid in entity_ids if eid}),
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            for entry in resp.json():
+                name_map[entry["id"]] = entry["name"]
+        else:
+            print(f"  ⚠ ESI /universe/names/ HTTP {resp.status_code} for misc entity IDs")
+    except Exception as e:
+        print(f"  Error resolving entity names: {e}")
+    return name_map
+
 
 async def get_type_group(client: httpx.AsyncClient, type_id: int) -> int | None:
     """Return the group_id for a ship type, using a process-lifetime cache."""
@@ -734,7 +763,9 @@ async def fetch_all_kills(
             if min_isk and total_value < min_isk:
                 continue
 
-            character_id = victim.get("character_id")
+            character_id   = victim.get("character_id")
+            corporation_id = victim.get("corporation_id")
+            alliance_id    = victim.get("alliance_id")
             char_ids.append(character_id or 0)
 
             isk_m = total_value / 1_000_000
@@ -743,6 +774,8 @@ async def fetch_all_kills(
                 "hash":            km_hash,
                 "ship_type_id":    victim.get("ship_type_id", 0),
                 "character_id":    character_id,
+                "corporation_id":  corporation_id,
+                "alliance_id":     alliance_id,
                 "solar_system_id": full.get("solar_system_id"),
                 "killmail_time":   full.get("killmail_time"),
                 "total_value":     total_value,
@@ -750,6 +783,9 @@ async def fetch_all_kills(
                 "zkill_url":       f"https://zkillboard.com/kill/{killmail_id}/",
                 "pilot_name":      None,  # filled below
                 "ship_name":       None,  # filled below
+                "corp_name":       None,  # filled below
+                "alliance_name":   None,  # filled below
+                "solar_system_name": None,  # filled below
                 "category":        k.get("_category"),
                 "space_type":      k.get("_space_type"),
             })
@@ -781,6 +817,23 @@ async def fetch_all_kills(
             type_name_map = await resolve_type_names(client, ship_type_ids)
             for entry in enriched:
                 entry["ship_name"] = type_name_map.get(entry["ship_type_id"], "Unknown Ship")
+
+        # Resolve solar system, corp, and alliance names in one bulk POST
+        misc_ids = []
+        for e in enriched:
+            if e.get("solar_system_id"): misc_ids.append(e["solar_system_id"])
+            if e.get("corporation_id"):  misc_ids.append(e["corporation_id"])
+            if e.get("alliance_id"):     misc_ids.append(e["alliance_id"])
+        if misc_ids:
+            print(f"  Resolving {len(set(misc_ids))} system/corp/alliance name(s)...")
+            misc_map = await resolve_misc_names(client, misc_ids)
+            for entry in enriched:
+                entry["solar_system_name"] = misc_map.get(entry.get("solar_system_id") or 0, "?")
+                entry["corp_name"]         = misc_map.get(entry.get("corporation_id")  or 0, "")
+                entry["alliance_name"]     = misc_map.get(entry.get("alliance_id")     or 0, "")
+
+        # Sort by ISK value descending — most valuable kills first
+        enriched.sort(key=lambda x: x.get("total_value", 0), reverse=True)
 
         # Log resolved kills (pilot + ship now both available)
         if on_log:
