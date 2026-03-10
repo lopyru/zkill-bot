@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 
 from fetcher import (
     fetch_all_kills, SHIP_CATEGORIES, TIME_RANGES,
-    EXCLUDED_ALLIANCE_IDS, EXCLUDED_CORP_IDS, search_entity_ids,
+    EXCLUDED_ALLIANCE_IDS, EXCLUDED_CORP_IDS,
+    search_entity_ids, fetch_entity_ticker, resolve_env_entities,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -1086,6 +1087,20 @@ async def daily_error(error: Exception):
 
 # ── /exclusions command group (admin-only) ────────────────────────────────────
 
+def _entry_name(v) -> str:
+    """Return name from an exclusions.json entry (supports both str and dict values)."""
+    return v["name"] if isinstance(v, dict) else v
+
+def _entry_ticker(v) -> str:
+    """Return ticker from an exclusions.json entry, or empty string."""
+    return v.get("ticker", "") if isinstance(v, dict) else ""
+
+def _fmt_entity(v) -> str:
+    """Format as '[TICK] Name' when a ticker is available, else just 'Name'."""
+    ticker = _entry_ticker(v)
+    return f"[{ticker}] {_entry_name(v)}" if ticker else _entry_name(v)
+
+
 class ExclusionConfirmView(discord.ui.View):
     """Confirm / cancel adding a single entity to the exclusion list."""
 
@@ -1097,19 +1112,21 @@ class ExclusionConfirmView(discord.ui.View):
     async def add_button(self, _button: discord.ui.Button, interaction: discord.Interaction):
         eid      = self.entity["id"]
         ename    = self.entity["name"]
+        ticker   = self.entity.get("ticker", "")
         category = self.entity["category"]   # "corporation" or "alliance"
 
+        entry = {"name": ename, "ticker": ticker}
         if category == "alliance":
-            _exclusions_cfg.setdefault("alliances", {})[str(eid)] = ename
+            _exclusions_cfg.setdefault("alliances", {})[str(eid)] = entry
             EXCLUDED_ALLIANCE_IDS.add(eid)
         else:
-            _exclusions_cfg.setdefault("corporations", {})[str(eid)] = ename
+            _exclusions_cfg.setdefault("corporations", {})[str(eid)] = entry
             EXCLUDED_CORP_IDS.add(eid)
         _save_exclusions()
 
         self.disable_all_items()
         await interaction.response.edit_message(
-            content=f"✅ **{ename}** ({category}) added to exclusions.",
+            content=f"✅ **{_fmt_entity(entry)}** ({category}) added to exclusions.",
             embed=None,
             view=self,
         )
@@ -1159,10 +1176,14 @@ async def add(ctx: discord.ApplicationContext, name: str):
         )
         return
 
+    ticker = await fetch_entity_ticker(entity["id"], entity["category"])
+    entity["ticker"] = ticker
+    label = _fmt_entity(entity)
+
     embed = discord.Embed(
         title="Add exclusion?",
         description=(
-            f"**{entity['name']}**\n"
+            f"**{label}**\n"
             f"Category: {entity['category']}\n"
             f"ID: `{entity['id']}`"
         ),
@@ -1172,51 +1193,109 @@ async def add(ctx: discord.ApplicationContext, name: str):
     await ctx.respond(embed=embed, view=view, ephemeral=True)
 
 
-@exclusions_grp.command(description="Remove a corp or alliance from the exclusion list by name")
-async def remove(ctx: discord.ApplicationContext, name: str):
-    name_lower = name.strip().lower()
-    removed: list[str] = []
+class ExclusionRemoveView(discord.ui.View):
+    """Ephemeral select menu that lets an admin pick which exclusion to remove."""
 
-    for eid, ename in list(_exclusions_cfg.get("alliances", {}).items()):
-        if ename.lower() == name_lower:
-            del _exclusions_cfg["alliances"][eid]
-            EXCLUDED_ALLIANCE_IDS.discard(int(eid))
-            removed.append(f"**{ename}** (alliance)")
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(timeout=60)
+        self.sel = discord.ui.Select(
+            placeholder="Pick a corp or alliance to remove…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.sel.callback = self._on_select
+        self.add_item(self.sel)
 
-    for eid, ename in list(_exclusions_cfg.get("corporations", {}).items()):
-        if ename.lower() == name_lower:
-            del _exclusions_cfg["corporations"][eid]
-            EXCLUDED_CORP_IDS.discard(int(eid))
-            removed.append(f"**{ename}** (corporation)")
+    async def _on_select(self, interaction: discord.Interaction):
+        value              = self.sel.values[0]        # "alliance:12345" or "corp:12345"
+        category, eid_str  = value.split(":", 1)
+        eid                = int(eid_str)
 
-    if not removed:
+        if category == "alliance":
+            entry = _exclusions_cfg.get("alliances", {}).pop(eid_str, None)
+            EXCLUDED_ALLIANCE_IDS.discard(eid)
+        else:
+            entry = _exclusions_cfg.get("corporations", {}).pop(eid_str, None)
+            EXCLUDED_CORP_IDS.discard(eid)
+
+        if entry is None:
+            await interaction.response.edit_message(
+                content="⚠️ Entry not found — it may have already been removed.", view=None
+            )
+            return
+
+        _save_exclusions()
+        cat_label = "alliance" if category == "alliance" else "corporation"
+        await interaction.response.edit_message(
+            content=f"✅ **{_fmt_entity(entry)}** ({cat_label}) removed from exclusions.",
+            view=None,
+        )
+
+
+@exclusions_grp.command(description="Remove a corp or alliance from the exclusion list")
+async def remove(ctx: discord.ApplicationContext):
+    options: list[discord.SelectOption] = []
+
+    for eid, entry in _exclusions_cfg.get("alliances", {}).items():
+        ticker = _entry_ticker(entry)
+        label  = f"[{ticker}] {_entry_name(entry)}" if ticker else _entry_name(entry)
+        options.append(discord.SelectOption(
+            label=label[:100],
+            description=f"Alliance · ID {eid}",
+            value=f"alliance:{eid}",
+        ))
+
+    for eid, entry in _exclusions_cfg.get("corporations", {}).items():
+        ticker = _entry_ticker(entry)
+        label  = f"[{ticker}] {_entry_name(entry)}" if ticker else _entry_name(entry)
+        options.append(discord.SelectOption(
+            label=label[:100],
+            description=f"Corporation · ID {eid}",
+            value=f"corp:{eid}",
+        ))
+
+    if not options:
         await ctx.respond(
-            f"❌ No exclusion found matching `{name}`.\n"
-            "Note: entries added via `.env` cannot be removed here — edit the env file instead.",
+            "No removable exclusions configured.\n"
+            "Note: entries set via `.env` must be removed by editing the env file.",
             ephemeral=True,
         )
         return
 
-    _save_exclusions()
-    await ctx.respond(f"✅ Removed: {', '.join(removed)}", ephemeral=True)
+    await ctx.respond(
+        content="Select a corp or alliance to remove from the exclusion list:",
+        view=ExclusionRemoveView(options),
+        ephemeral=True,
+    )
 
 
 @exclusions_grp.command(name="list", description="Show all excluded corporations and alliances")
 async def exclusions_list(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
     lines: list[str] = []
 
-    for eid, ename in sorted(_exclusions_cfg.get("alliances", {}).items(), key=lambda x: x[1].lower()):
-        lines.append(f"🔷 **{ename}** — alliance · ID `{eid}`")
-    for eid, ename in sorted(_exclusions_cfg.get("corporations", {}).items(), key=lambda x: x[1].lower()):
-        lines.append(f"🔶 **{ename}** — corp · ID `{eid}`")
+    for eid, entry in sorted(_exclusions_cfg.get("alliances", {}).items(), key=lambda x: _entry_name(x[1]).lower()):
+        lines.append(f"🔷 **{_fmt_entity(entry)}** — alliance · ID `{eid}`")
+    for eid, entry in sorted(_exclusions_cfg.get("corporations", {}).items(), key=lambda x: _entry_name(x[1]).lower()):
+        lines.append(f"🔶 **{_fmt_entity(entry)}** — corp · ID `{eid}`")
 
-    # Show IDs that came from .env and have no name in exclusions.json
+    # .env-only IDs: fetch name + ticker live from ESI
     json_alliance_ids = {int(k) for k in _exclusions_cfg.get("alliances", {})}
     json_corp_ids     = {int(k) for k in _exclusions_cfg.get("corporations", {})}
-    for eid in sorted(EXCLUDED_ALLIANCE_IDS - json_alliance_ids):
-        lines.append(f"🔷 ID `{eid}` — alliance · *from .env*")
-    for eid in sorted(EXCLUDED_CORP_IDS - json_corp_ids):
-        lines.append(f"🔶 ID `{eid}` — corp · *from .env*")
+    env_only = list((EXCLUDED_ALLIANCE_IDS - json_alliance_ids) | (EXCLUDED_CORP_IDS - json_corp_ids))
+    if env_only:
+        resolved = await resolve_env_entities(env_only)
+        for eid in sorted(env_only):
+            info = resolved.get(eid)
+            if info:
+                emoji     = "🔷" if info["category"] == "alliance" else "🔶"
+                cat_label = "alliance" if info["category"] == "alliance" else "corp"
+                ticker_part = f"[{info['ticker']}] " if info["ticker"] else ""
+                lines.append(f"{emoji} **{ticker_part}{info['name']}** — {cat_label} · ID `{eid}` · *from .env*")
+            else:
+                emoji = "🔷" if eid in EXCLUDED_ALLIANCE_IDS else "🔶"
+                lines.append(f"{emoji} ID `{eid}` — *from .env*")
 
     if not lines:
         await ctx.respond("No exclusions configured.", ephemeral=True)

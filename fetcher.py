@@ -906,7 +906,68 @@ async def fetch_all_kills(
         return enriched
 
 
-# ── Entity search (for /exclusions add) ──────────────────────────────────────
+# ── Entity search & detail fetchers (for /exclusions) ────────────────────────
+
+async def fetch_entity_ticker(entity_id: int, category: str) -> str:
+    """
+    Fetch the ticker for a single corp or alliance.
+    category: "corporation" or "alliance"
+    """
+    endpoint = "corporations" if category == "corporation" else "alliances"
+    async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
+        try:
+            resp = await client.get(
+                f"{ESI_BASE}/{endpoint}/{entity_id}/?datasource=tranquility"
+            )
+            if resp.status_code == 200:
+                return resp.json().get("ticker", "")
+        except Exception:
+            pass
+    return ""
+
+
+async def resolve_env_entities(entity_ids: list[int]) -> dict[int, dict]:
+    """
+    For a list of IDs with unknown category (typically from .env), resolve name,
+    category, and ticker via ESI.
+    Returns {id: {"name": str, "ticker": str, "category": str}}.
+    """
+    result: dict[int, dict] = {}
+    if not entity_ids:
+        return result
+
+    async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
+        # Step 1: name + category from /universe/names/
+        try:
+            resp = await client.post(
+                f"{ESI_BASE}/universe/names/?datasource=tranquility",
+                json=entity_ids,
+            )
+            if resp.status_code == 200:
+                for entry in resp.json():
+                    result[entry["id"]] = {
+                        "name":     entry["name"],
+                        "category": entry["category"],  # "corporation" or "alliance"
+                        "ticker":   "",
+                    }
+        except Exception:
+            pass
+
+        # Step 2: ticker from the specific corp/alliance endpoint
+        for eid, info in result.items():
+            endpoint = "corporations" if info["category"] == "corporation" else "alliances"
+            try:
+                resp = await client.get(
+                    f"{ESI_BASE}/{endpoint}/{eid}/?datasource=tranquility"
+                )
+                if resp.status_code == 200:
+                    info["ticker"] = resp.json().get("ticker", "")
+            except Exception:
+                pass
+            await asyncio.sleep(ESI_DELAY)
+
+    return result
+
 
 async def search_entity_ids(name: str) -> list[dict]:
     """
