@@ -959,6 +959,14 @@ async def help(ctx: discord.ApplicationContext, public: bool = False):
         ),
         inline=False,
     )
+    embed.add_field(
+        name="🚫 /exclusions  *(admin)*",
+        value=(
+            "`add <name>` · `remove <name>` · `list`\n"
+            "Manage excluded corporations and alliances (victims only)."
+        ),
+        inline=False,
+    )
     embed.set_footer(text="Data via zKillboard + ESI")
     await ctx.respond(embed=embed, ephemeral=not public)
 
