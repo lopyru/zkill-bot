@@ -124,7 +124,7 @@ def build_summary_embed(kills: list[dict], category_keys: list[str], time_key: s
     space_str = "  ·  ".join(v for s, v in _SPACE.items() if s in present)
 
     embed = discord.Embed(
-        title="Kill Report  ✅",
+        title="☠️ Dead Pilots Report",
         description=(
             f"**🚢 Ship categories:**\n{cat_names}\n"
             f"**⏱ Time Range:**\n{time_label}\n"
@@ -606,7 +606,6 @@ class KillFilterView(discord.ui.View):
             )
             if _stop_event is not None and _stop_event.is_set():
                 await channel.send(f"⏹ **Scan stopped.** No results posted.")
-                await status_msg.edit(content="⏹ Stopped.")
             elif not kills:
                 _SPACE_NAMES = {"nullsec": "Null Sec", "lowsec": "Low Sec", "wormhole": "Wormhole Space", "highsec": "High Sec"}
                 space_msg = " + ".join(_SPACE_NAMES[s] for s in self.selected_space if s in _SPACE_NAMES)
@@ -616,22 +615,19 @@ class KillFilterView(discord.ui.View):
                         f"in the **{time_label.lower()}** in **{space_msg}**."
                     )
                 )
-                await status_msg.edit(content="✅ Done — no results.")
             else:
                 embed = build_summary_embed(kills, self.selected_categories, time_key,
                                             elapsed=_time.monotonic() - _fetch_start_ts)
                 _last_embeds.appendleft(embed)
                 await channel.send(content=f"{caller.mention} — kill report ready!", embed=embed)
-                await status_msg.edit(content="✅ Done!")
                 try:
                     await post_kill_details(channel, kills)
                 except Exception as e:
                     await channel.send(f"⚠️ Kill details could not be posted: `{type(e).__name__}: {e}`")
         except asyncio.TimeoutError:
             await channel.send(f"{caller.mention} ⏱ **Scan timed out** after 1 hour — no results posted.")
-            await status_msg.edit(content="⏱ Timed out.")
         except Exception as e:
-            await status_msg.edit(content=f"❌ Fetch failed: `{type(e).__name__}: {e}`")
+            await channel.send(f"❌ **Fetch failed:** `{type(e).__name__}: {e}`")
         finally:
             _loop_stop[0] = True
             loop_task.cancel()
@@ -641,6 +637,10 @@ class KillFilterView(discord.ui.View):
             _fetch_phase    = ""
             _fetch_start_ts = None
             fetch_in_progress = False
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
     # ── Region filter button ──────────────────────────────────────────────────
 
@@ -813,7 +813,7 @@ async def _run_daily_fetch(channel: discord.TextChannel) -> None:
             return
         embed = build_summary_embed(kills, _daily_cfg["categories"], _daily_cfg["time_key"],
                                     elapsed=_time.monotonic() - _daily_start)
-        embed.title = "📅 Daily Kill Report  ✅"
+        embed.title = "📅 Daily Dead Pilots Report"
         await channel.send(embed=embed)
         try:
             await post_kill_details(channel, kills)
