@@ -19,12 +19,12 @@ A Discord bot that fetches EVE Online killmail data from [zKillboard](https://zk
 | `/daily toggle` *(admin)* | Enable or disable the scheduled daily report |
 | `/daily run` *(admin)* | Trigger the daily report immediately with the current configuration |
 | `/exclusions add <name>` *(admin)* | Search ESI for a corp or alliance by exact name and add it to the exclusion list |
-| `/exclusions remove <name>` *(admin)* | Remove a corp or alliance from the exclusion list |
+| `/exclusions remove` *(admin)* | Pick a corp or alliance to remove via a select menu |
 | `/exclusions list` *(admin)* | Show all currently excluded corps and alliances |
 
 ## Features
 
-- **Live progress panel** — Public terminal-style status message updated in real time during a scan
+- **Live progress panel** — Public terminal-style status message updated in real time during a scan; automatically deleted when the scan completes
 - **Automatic daily summary** — Posts a scheduled kill report to a configured channel every 24 hours
 - **Kill report embed** — Total kills, unique pilots, total ISK destroyed, breakdown by category and security space
 - **Detailed kill list** — Per-kill breakdown with pilot, corp, ship, ISK, system, timestamp and zKillboard link; falls back to a `kills.txt` file attachment when the list is too long for a Discord message
@@ -129,4 +129,4 @@ zkill-bot/
 
 ## Time ranges
 
-`15m` · `30m` · `1h` · `6h` · `12h` · `24h` · `48h` · `7d`
+`15m` · `30m` · `1h` · `3h` · `6h` · `9h` · `12h` · `18h` · `24h` · `48h` · `7d`
